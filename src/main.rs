@@ -13,8 +13,10 @@ use code_complexity_comparator_rs::lang_fortran::FortranAnalyzer;
 use code_complexity_comparator_rs::lang_perl::PerlAnalyzer;
 use code_complexity_comparator_rs::lang_r::RAnalyzer;
 use code_complexity_comparator_rs::lang_rust::RustAnalyzer;
+use code_complexity_comparator_rs::order;
 use code_complexity_comparator_rs::predict::{predict_report, train, Model};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
@@ -80,6 +82,41 @@ enum Cmd {
         top: usize,
         #[arg(long, default_value = "table")]
         format: FormatArg,
+    },
+    /// Emit functions in bottom-up porting order (callees before callers) as CSV.
+    /// Mutually recursive groups are labelled so they can be translated together.
+    /// `path` can be a source file, a source directory, or a previously-generated
+    /// `report.json`.
+    Order {
+        path: PathBuf,
+        #[arg(short = 'l', long)]
+        lang: Option<LangArg>,
+        #[arg(long)]
+        recurse: bool,
+        #[arg(short = 'o', long)]
+        out: Option<PathBuf>,
+        /// Drop edges for ambiguous callee names instead of conservatively
+        /// adding edges to all candidates.
+        #[arg(long)]
+        strict: bool,
+        /// Previous order.csv: carry forward `translated` values for rows
+        /// whose (name, file) still appear.
+        #[arg(long)]
+        merge: Option<PathBuf>,
+    },
+    /// Annotate an order.csv with the Rust counterpart of each function.
+    /// Uses the same matching strategies as `compare` / `missing`.
+    OrderAnnotate {
+        csv: PathBuf,
+        /// The other-language report the CSV was generated from.
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        rust: PathBuf,
+        #[arg(long)]
+        mapping: Option<PathBuf>,
+        #[arg(short = 'o', long)]
+        out: Option<PathBuf>,
     },
     /// Train or apply the prediction model.
     Predict {
@@ -177,6 +214,12 @@ fn main() -> Result<()> {
         Cmd::Sort { report, by, top, format } => cmd_sort(&report, &by, top, format),
         Cmd::ConstantsDiff { rust, other, mapping, top, format } => {
             cmd_constants_diff(&rust, &other, mapping.as_deref(), top, format)
+        }
+        Cmd::Order { path, lang, recurse, out, strict, merge } => {
+            cmd_order(&path, lang, recurse, out.as_deref(), strict, merge.as_deref())
+        }
+        Cmd::OrderAnnotate { csv, source, rust, mapping, out } => {
+            cmd_order_annotate(&csv, &source, &rust, mapping.as_deref(), out.as_deref())
         }
         Cmd::Predict { sub } => match sub {
             PredictCmd::Train { pairs_dir, model } => cmd_predict_train(&pairs_dir, &model),
@@ -502,6 +545,92 @@ fn cmd_predict_apply(
         eprintln!("wrote {}", p.display());
     } else {
         println!("{}", s);
+    }
+    Ok(())
+}
+
+fn cmd_order(
+    path: &Path,
+    lang: Option<LangArg>,
+    recurse: bool,
+    out: Option<&Path>,
+    strict: bool,
+    merge: Option<&Path>,
+) -> Result<()> {
+    let report = if path.extension().and_then(|e| e.to_str()) == Some("json") {
+        load_report(path)?
+    } else {
+        let reg = build_registry();
+        let mut reports: Vec<Report> = Vec::new();
+        if path.is_file() {
+            reports.push(analyze_file(&reg, path, lang.map(|l| l.to_language()))?);
+        } else if path.is_dir() {
+            collect_and_analyze_dir(&reg, path, lang.map(|l| l.to_language()), recurse, &mut reports)?;
+        } else {
+            return Err(anyhow!(
+                "not a file, directory, or .json report: {}",
+                path.display()
+            ));
+        }
+        if reports.is_empty() {
+            return Err(anyhow!("no files analyzed under {}", path.display()));
+        }
+        let language = reports.first().map(|r| r.language).unwrap_or(Language::Unknown);
+        let mut merged = Report {
+            schema_version: code_complexity_comparator_rs::core::SCHEMA_VERSION,
+            language,
+            source_file: path.to_path_buf(),
+            source_hash: String::new(),
+            functions: Vec::new(),
+        };
+        for sub in reports {
+            merged.functions.extend(sub.functions);
+        }
+        merged
+    };
+
+    let g = order::build_call_graph(&report, strict);
+    let ord = order::order_bottom_up(&g);
+    let edges: usize = g.edges.iter().map(|v| v.len()).sum();
+    eprintln!(
+        "graph: {} functions, {} edges, {} ambiguous call sites, {} unresolved",
+        report.functions.len(),
+        edges,
+        g.ambiguous_call_sites,
+        g.unresolved_call_sites,
+    );
+
+    let prev = match merge {
+        Some(p) => order::read_translated_map(p)?,
+        None => HashMap::new(),
+    };
+    let csv = order::render_order_csv(&g, &ord, &prev);
+    if let Some(p) = out {
+        std::fs::write(p, &csv)?;
+        eprintln!("wrote {} ({} rows)", p.display(), ord.len());
+    } else {
+        print!("{}", csv);
+    }
+    Ok(())
+}
+
+fn cmd_order_annotate(
+    csv_path: &Path,
+    source: &Path,
+    rust: &Path,
+    mapping: Option<&Path>,
+    out: Option<&Path>,
+) -> Result<()> {
+    let csv = order::read_csv(csv_path)?;
+    let source_r = load_report(source)?;
+    let rust_r = load_report(rust)?;
+    let map = mapping.map(Mapping::load).transpose()?;
+    let s = order::render_annotated_csv(&csv, &source_r, &rust_r, map.as_ref())?;
+    if let Some(p) = out {
+        std::fs::write(p, &s)?;
+        eprintln!("wrote {}", p.display());
+    } else {
+        print!("{}", s);
     }
     Ok(())
 }

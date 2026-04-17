@@ -76,6 +76,38 @@ Language is auto-detected from file extension when `-l` is omitted. Cross-langua
 | `constants-diff <rust.json> <other.json>` | Per matched pair, shows integer/float/string/char/bool constants present on only one side. Ranked by divergence score. |
 | `predict train <pairs_dir> --model model.json` | Fits one linear model per target metric via closed-form OLS over matched pairs. |
 | `predict apply --model model.json --source c.json [--against rust.json]` | Predicts expected Rust metrics from C; with `--against`, also reports z-scores of actual-minus-predicted for outlier detection. |
+| `order <path>` | Emit functions in bottom-up porting order as CSV (callees before callers). `path` is a source file, source directory (use `--recurse`), or a `report.json`. Mutually recursive groups are labelled so they can be translated together. Flags: `-l`, `--recurse`, `-o file.csv`, `--strict`, `--merge prev.csv`. |
+| `order-annotate <csv> --source other.json --rust rust.json` | Append Rust counterpart columns (`rust_name`, `rust_file`, `rust_line_start`, `match_strategy`) to a CSV from `order`. Accepts `--mapping map.toml`. |
+
+### Bottom-up porting workflow
+
+```sh
+# 1. Emit the porting order for a C tree (or a pre-built report).
+./target/release/ccc-rs order path/to/c_src --recurse -l c -o order.csv
+
+# 2. Edit `translated` from FALSE to TRUE as each function is ported.
+
+# 3. Re-run later (e.g. after source edits) and preserve the flags:
+./target/release/ccc-rs order path/to/c_src --recurse -l c --merge order.csv -o order.csv
+
+# 4. Join against a Rust report to see which Rust function each row maps to:
+./target/release/ccc-rs analyze path/to/rust_src -l rust --recurse -o rust.json
+./target/release/ccc-rs analyze path/to/c_src    -l c    --recurse -o c.json
+./target/release/ccc-rs order-annotate order.csv --source c.json --rust rust.json -o annotated.csv
+```
+
+CSV schema:
+
+| column | meaning |
+|--------|---------|
+| `name` | function name |
+| `file` | source file (as recorded in the report) |
+| `line_start` | first line of the function |
+| `scc_id` | blank for non-recursive functions; shared integer for members of a recursion group |
+| `scc_kind` | `self` for direct self-recursion, `mutual` for mutual recursion, else blank |
+| `translated` | starts `FALSE`; edit to `TRUE` as you port. Preserved across re-runs via `--merge`. |
+
+Callee resolution is **name-based** — `Call.callee` strings are reduced to the bare identifier (see "Known limitations"). Same-named functions in different files cause ambiguity; by default `order` adds an edge to every candidate (a safe over-approximation: it can pull a dependency earlier, never later). Pass `--strict` to drop ambiguous edges instead. The stderr summary reports counts for ambiguous and unresolved call sites so you know how much name-only resolution is costing you.
 
 ### Mapping file
 
@@ -93,6 +125,37 @@ other = "mm_map_frag_core"
 ```
 
 `--mapping map.toml` is accepted by `compare`, `missing`, `constants-diff`, and `predict apply`.
+
+#### Disambiguating same-named functions
+
+If the same function name appears in several modules (e.g. a `decode`
+helper in every message type), add a `rust_path` and/or `other_path`
+constraint. Each is a path *suffix* matched on path components against
+`Location.file`, so you write the relative path the way you'd see it in
+the repo:
+
+```toml
+[[entries]]
+rust       = "decode"
+rust_path  = "format/messages/datatype.rs"
+other      = "H5O__dtype_decode"
+
+[[entries]]
+rust       = "decode"
+rust_path  = "format/messages/link.rs"
+other      = "H5O__link_decode"
+
+[[entries]]
+rust       = "decompress"
+rust_path  = "filters/scaleoffset.rs"
+other      = "H5Z__scaleoffset_decompress"
+other_path = "src/H5Zscaleoffset.c"
+```
+
+A bare `rust = "name"` (no `rust_path`) keeps the previous behavior:
+the first unused candidate by name is paired. Path matching is on whole
+path components, so `messages/datatype.rs` matches
+`/abs/.../src/format/messages/datatype.rs` but `atype.rs` does **not**.
 
 ### Matching strategies
 

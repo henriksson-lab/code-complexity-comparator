@@ -105,34 +105,44 @@ pub trait LanguageSpec: Send + Sync {
 }
 
 fn parse_int_default(text: &str) -> Option<i64> {
+    // Detect the radix prefix *first*, then consume only digits valid for
+    // that radix. Everything after the first non-digit is the type suffix
+    // (`u32`, `ULL`, `i64`, `usize`, …) and is discarded. The prior version
+    // stripped trailing alphabetic characters before detecting the prefix,
+    // which turned `0xFF` into `0` (the `x`, `F`, `F` were all stripped as
+    // "suffix") and silently bucketed every hex literal as zero.
     let t = text.trim();
-    // strip Rust/C suffixes
-    let mut end = t.len();
-    let bytes = t.as_bytes();
-    while end > 0 {
-        let c = bytes[end - 1];
-        if c.is_ascii_alphabetic() || c == b'_' {
-            end -= 1;
-        } else {
-            break;
-        }
-    }
-    let t = &t[..end];
     let neg = t.starts_with('-');
     let t = if neg { &t[1..] } else { t };
-    let cleaned: String = t.chars().filter(|c| *c != '_' && *c != '\'').collect();
-    // Parse as unsigned up to u64, then fit into i64, so constants like
-    // 0xFFFFFFFF round-trip correctly without tripping the signed overflow.
-    let u: Option<u64> = if let Some(rest) = cleaned.strip_prefix("0x").or_else(|| cleaned.strip_prefix("0X")) {
-        u64::from_str_radix(rest, 16).ok()
-    } else if let Some(rest) = cleaned.strip_prefix("0b").or_else(|| cleaned.strip_prefix("0B")) {
-        u64::from_str_radix(rest, 2).ok()
-    } else if let Some(rest) = cleaned.strip_prefix("0o").or_else(|| cleaned.strip_prefix("0O")) {
-        u64::from_str_radix(rest, 8).ok()
+    let (radix, body) = if let Some(rest) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        (16u32, rest)
+    } else if let Some(rest) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+        (2u32, rest)
+    } else if let Some(rest) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
+        (8u32, rest)
     } else {
-        cleaned.parse::<u64>().ok()
+        (10u32, t)
     };
-    let v = u.map(|x| x as i64)?;
+    let mut end = 0usize;
+    for (i, ch) in body.char_indices() {
+        if ch == '_' || ch == '\'' {
+            end = i + ch.len_utf8();
+            continue;
+        }
+        if ch.is_digit(radix) {
+            end = i + ch.len_utf8();
+            continue;
+        }
+        break;
+    }
+    let digits: String = body[..end].chars().filter(|c| *c != '_' && *c != '\'').collect();
+    if digits.is_empty() {
+        return None;
+    }
+    // Parse as unsigned so constants like 0xFFFFFFFF round-trip without
+    // tripping signed-overflow, then reinterpret as i64.
+    let u = u64::from_str_radix(&digits, radix).ok()?;
+    let v = u as i64;
     Some(if neg { v.wrapping_neg() } else { v })
 }
 
@@ -609,5 +619,87 @@ pub fn collect_functions<'a, S: LanguageSpec>(
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
         collect_functions(spec, child, src, out);
+    }
+}
+
+#[cfg(test)]
+mod parse_int_tests {
+    use super::parse_int_default;
+
+    #[test]
+    fn decimal_round_trip() {
+        assert_eq!(parse_int_default("0"), Some(0));
+        assert_eq!(parse_int_default("1"), Some(1));
+        assert_eq!(parse_int_default("255"), Some(255));
+        assert_eq!(parse_int_default("1024"), Some(1024));
+        assert_eq!(parse_int_default("-7"), Some(-7));
+    }
+
+    #[test]
+    fn hex_no_longer_collapses_to_zero() {
+        // The original bug: every hex literal returned Some(0) because the
+        // suffix-stripping pass ate `x` and the hex digits.
+        assert_eq!(parse_int_default("0xFF"), Some(255));
+        assert_eq!(parse_int_default("0xff"), Some(255));
+        assert_eq!(parse_int_default("0x0F"), Some(15));
+        assert_eq!(parse_int_default("0xFFFF"), Some(0xFFFF));
+        assert_eq!(parse_int_default("0xffffffff"), Some(0xFFFFFFFFi64));
+        assert_eq!(parse_int_default("0XABCDEF"), Some(0xABCDEF));
+        assert_eq!(parse_int_default("0x40"), Some(64));
+    }
+
+    #[test]
+    fn binary_and_octal() {
+        assert_eq!(parse_int_default("0b1010"), Some(10));
+        assert_eq!(parse_int_default("0B11"), Some(3));
+        assert_eq!(parse_int_default("0o17"), Some(15));
+        assert_eq!(parse_int_default("0O20"), Some(16));
+    }
+
+    #[test]
+    fn rust_type_suffixes_stripped() {
+        assert_eq!(parse_int_default("1024usize"), Some(1024));
+        assert_eq!(parse_int_default("0xFFu32"), Some(255));
+        assert_eq!(parse_int_default("0x40u8"), Some(64));
+        assert_eq!(parse_int_default("100i64"), Some(100));
+        assert_eq!(parse_int_default("0b101_010u16"), Some(0b101010));
+    }
+
+    #[test]
+    fn c_type_suffixes_stripped() {
+        assert_eq!(parse_int_default("0xFFFFFFFFu"), Some(0xFFFFFFFFi64));
+        assert_eq!(parse_int_default("0xFFULL"), Some(255));
+        assert_eq!(parse_int_default("100L"), Some(100));
+        assert_eq!(parse_int_default("100UL"), Some(100));
+        assert_eq!(parse_int_default("0x1LL"), Some(1));
+    }
+
+    #[test]
+    fn separators_stripped() {
+        assert_eq!(parse_int_default("1_000_000"), Some(1_000_000));
+        assert_eq!(parse_int_default("0xFF_FF"), Some(0xFFFF));
+        // C++14 single-quote digit separator
+        assert_eq!(parse_int_default("100'000"), Some(100_000));
+    }
+
+    #[test]
+    fn negative_hex() {
+        assert_eq!(parse_int_default("-0xFF"), Some(-255));
+    }
+
+    #[test]
+    fn signed_overflow_wraps_into_i64() {
+        // 0x8000000000000000 is i64::MIN as a u64; we round-trip through u64
+        // and reinterpret, so this should not return None.
+        assert_eq!(
+            parse_int_default("0x8000000000000000"),
+            Some(i64::MIN)
+        );
+    }
+
+    #[test]
+    fn rejects_pure_garbage() {
+        assert_eq!(parse_int_default("xyz"), None);
+        assert_eq!(parse_int_default("0x"), None);
     }
 }

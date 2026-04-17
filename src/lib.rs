@@ -9,4 +9,5 @@ pub mod lang_r;
 pub mod lang_perl;
 pub mod lang_fortran;
 pub mod compare;
+pub mod order;
 pub mod predict;

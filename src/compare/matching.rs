@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use crate::core::{FunctionAnalysis, Report};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Component, Path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MatchStrategy {
@@ -30,6 +30,19 @@ pub struct Mapping {
 pub struct MappingEntry {
     pub rust: String,
     pub other: String,
+    /// Optional path constraint for the Rust function: a path *suffix* (in
+    /// path-component units) of `Location.file`. When set, only Rust functions
+    /// whose source file ends with these components are considered. Lets the
+    /// user disambiguate same-named functions across modules — e.g.
+    ///   rust = "decode", rust_path = "format/messages/datatype.rs"
+    /// matches only the `decode` defined in
+    ///   .../src/format/messages/datatype.rs
+    /// and not other `decode` functions elsewhere in the report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rust_path: Option<String>,
+    /// Same as `rust_path`, for the other-language side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other_path: Option<String>,
 }
 
 impl Mapping {
@@ -60,20 +73,33 @@ pub fn match_reports<'a>(
     let mut used_other: HashSet<usize> = HashSet::new();
 
     // 1. Explicit mapping.
+    //
+    // Each entry pins one Rust function to one other-language function by
+    // name, optionally constrained by a path suffix on either side so the
+    // same name in different modules can be disambiguated. When several
+    // candidates remain after the optional path filter, the first unused
+    // one wins — which means callers should pin both sides whenever a name
+    // is overloaded across files.
     if let Some(m) = mapping {
         for e in &m.entries {
-            let ri = rust.functions.iter().position(|f| f.name == e.rust);
-            let oi = other.functions.iter().position(|f| f.name == e.other);
-            if let (Some(ri), Some(oi)) = (ri, oi) {
-                if !used_rust.contains(&ri) && !used_other.contains(&oi) {
-                    used_rust.insert(ri);
-                    used_other.insert(oi);
-                    pairs.push(Pair {
-                        rust: &rust.functions[ri],
-                        other: &other.functions[oi],
-                        strategy: MatchStrategy::Mapping,
-                    });
-                }
+            let ri = rust.functions.iter().enumerate().find(|(i, f)| {
+                !used_rust.contains(i)
+                    && f.name == e.rust
+                    && path_suffix_matches(&f.location.file, e.rust_path.as_deref())
+            });
+            let oi = other.functions.iter().enumerate().find(|(i, f)| {
+                !used_other.contains(i)
+                    && f.name == e.other
+                    && path_suffix_matches(&f.location.file, e.other_path.as_deref())
+            });
+            if let (Some((ri, _)), Some((oi, _))) = (ri, oi) {
+                used_rust.insert(ri);
+                used_other.insert(oi);
+                pairs.push(Pair {
+                    rust: &rust.functions[ri],
+                    other: &other.functions[oi],
+                    strategy: MatchStrategy::Mapping,
+                });
             }
         }
     }
@@ -242,5 +268,206 @@ fn bucket_log(n: u32) -> u32 {
         0
     } else {
         (n as f64).log2() as u32
+    }
+}
+
+/// Returns true if `file` ends with the path components of `suffix`. When
+/// `suffix` is None, the constraint is satisfied vacuously. Matching is on
+/// path components, so `format/messages/datatype.rs` matches
+/// `/abs/.../src/format/messages/datatype.rs` but not
+/// `format/messages_datatype.rs` and not partial component prefixes
+/// (`atype.rs` does NOT match `datatype.rs`).
+pub(crate) fn path_suffix_matches(file: &Path, suffix: Option<&str>) -> bool {
+    let Some(suffix) = suffix else {
+        return true;
+    };
+    let want: Vec<&std::ffi::OsStr> = Path::new(suffix)
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    if want.is_empty() {
+        return true;
+    }
+    let have: Vec<&std::ffi::OsStr> = file
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    if have.len() < want.len() {
+        return false;
+    }
+    have[have.len() - want.len()..] == want[..]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{Halstead, Language, Location, Metrics, Report, Signature};
+    use std::path::PathBuf;
+
+    fn fa(name: &str, file: &str) -> FunctionAnalysis {
+        FunctionAnalysis {
+            name: name.into(),
+            original_name: None,
+            mangled: None,
+            location: Location {
+                file: PathBuf::from(file),
+                line_start: 1,
+                line_end: 2,
+                col_start: 0,
+                col_end: 0,
+                byte_start: 0,
+                byte_end: 0,
+            },
+            signature: Signature::default(),
+            metrics: Metrics {
+                halstead: Halstead::default(),
+                ..Default::default()
+            },
+            constants: vec![],
+            calls: vec![],
+            types_used: vec![],
+            attributes: Default::default(),
+        }
+    }
+
+    fn rep(lang: Language, fns: Vec<FunctionAnalysis>) -> Report {
+        Report {
+            schema_version: crate::core::SCHEMA_VERSION,
+            language: lang,
+            source_file: PathBuf::from("/tmp/x"),
+            source_hash: "0".into(),
+            functions: fns,
+        }
+    }
+
+    #[test]
+    fn path_suffix_matches_basics() {
+        let p = Path::new("/a/b/c/format/messages/datatype.rs");
+        assert!(path_suffix_matches(p, None));
+        assert!(path_suffix_matches(p, Some("datatype.rs")));
+        assert!(path_suffix_matches(p, Some("messages/datatype.rs")));
+        assert!(path_suffix_matches(p, Some("format/messages/datatype.rs")));
+        assert!(path_suffix_matches(p, Some("/format/messages/datatype.rs")));
+        assert!(!path_suffix_matches(p, Some("atype.rs")));
+        assert!(!path_suffix_matches(p, Some("link.rs")));
+        assert!(!path_suffix_matches(
+            p,
+            Some("wrong/messages/datatype.rs")
+        ));
+    }
+
+    #[test]
+    fn mapping_disambiguates_same_named_rust_functions() {
+        // Two `decode` Rust functions in different files; mapping pins one of
+        // them to a specific C target by path. The other should remain
+        // available for a second mapping entry or for fingerprint matching.
+        let r = rep(
+            Language::Rust,
+            vec![
+                fa("decode", "/abs/src/format/messages/datatype.rs"),
+                fa("decode", "/abs/src/format/messages/link.rs"),
+            ],
+        );
+        let o = rep(
+            Language::C,
+            vec![
+                fa("H5O__dtype_decode", "/abs/hdf5/src/H5Odtype.c"),
+                fa("H5O__link_decode", "/abs/hdf5/src/H5Olink.c"),
+            ],
+        );
+        let m = Mapping {
+            entries: vec![
+                MappingEntry {
+                    rust: "decode".into(),
+                    rust_path: Some("messages/datatype.rs".into()),
+                    other: "H5O__dtype_decode".into(),
+                    other_path: None,
+                },
+                MappingEntry {
+                    rust: "decode".into(),
+                    rust_path: Some("messages/link.rs".into()),
+                    other: "H5O__link_decode".into(),
+                    other_path: None,
+                },
+            ],
+        };
+        let res = match_reports(&r, &o, Some(&m));
+        assert_eq!(res.pairs.len(), 2);
+        for p in &res.pairs {
+            assert_eq!(p.strategy, MatchStrategy::Mapping);
+            let rfile = p.rust.location.file.to_string_lossy().to_string();
+            let ofile = p.other.location.file.to_string_lossy().to_string();
+            match rfile.as_str() {
+                f if f.ends_with("datatype.rs") => assert!(ofile.ends_with("H5Odtype.c")),
+                f if f.ends_with("link.rs") => assert!(ofile.ends_with("H5Olink.c")),
+                f => panic!("unexpected rust file in pair: {}", f),
+            }
+        }
+    }
+
+    #[test]
+    fn mapping_without_path_falls_back_to_first_unused() {
+        // Bare-name mapping (no rust_path / other_path) keeps prior behavior:
+        // the first unused candidate on each side is paired by Mapping. The
+        // remaining duplicates fall through to later strategies.
+        let r = rep(
+            Language::Rust,
+            vec![
+                fa("decode", "/abs/src/a.rs"),
+                fa("decode", "/abs/src/b.rs"),
+            ],
+        );
+        let o = rep(
+            Language::C,
+            vec![
+                fa("c_decode", "/abs/hdf5/src/x.c"),
+                fa("c_decode", "/abs/hdf5/src/y.c"),
+            ],
+        );
+        let m = Mapping {
+            entries: vec![MappingEntry {
+                rust: "decode".into(),
+                rust_path: None,
+                other: "c_decode".into(),
+                other_path: None,
+            }],
+        };
+        let res = match_reports(&r, &o, Some(&m));
+        let mapping_pairs: Vec<&Pair> = res
+            .pairs
+            .iter()
+            .filter(|p| p.strategy == MatchStrategy::Mapping)
+            .collect();
+        assert_eq!(mapping_pairs.len(), 1, "exactly one Mapping pair expected");
+        assert!(mapping_pairs[0].rust.location.file.ends_with("a.rs"));
+        assert!(mapping_pairs[0].other.location.file.ends_with("x.c"));
+    }
+
+    #[test]
+    fn mapping_skips_when_path_filter_eliminates_all_candidates() {
+        // The path filter rules out the only Rust candidate, so no Mapping
+        // pair is created. Later strategies (Normalized) may still pair the
+        // functions, but with strategy != Mapping.
+        let r = rep(Language::Rust, vec![fa("decode", "/abs/src/a.rs")]);
+        let o = rep(Language::C, vec![fa("c_decode", "/abs/hdf5/src/x.c")]);
+        let m = Mapping {
+            entries: vec![MappingEntry {
+                rust: "decode".into(),
+                rust_path: Some("nope/wrong.rs".into()),
+                other: "c_decode".into(),
+                other_path: None,
+            }],
+        };
+        let res = match_reports(&r, &o, Some(&m));
+        assert!(
+            !res.pairs.iter().any(|p| p.strategy == MatchStrategy::Mapping),
+            "no pair should be created via Mapping strategy"
+        );
     }
 }
