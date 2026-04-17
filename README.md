@@ -38,13 +38,38 @@ cargo build --release
 
 `pairs_dir/` for training must contain files named `<base>.rust.json` and `<base>.c.json` (or `.cpp.json`) for each matched pair.
 
+## Supported languages
+
+| Language | `-l` value | File extensions | Grammar |
+|----------|-----------|-----------------|---------|
+| C        | `c`       | `.c`, `.h` | `tree-sitter-c` |
+| C++      | `cpp`     | `.cc`, `.cpp`, `.cxx`, `.hpp`, `.hh`, `.hxx` | `tree-sitter-cpp` |
+| Rust     | `rust`    | `.rs` | `tree-sitter-rust` |
+| Java     | `java`    | `.java` | `tree-sitter-java` |
+| Python   | `python`  | `.py` | `tree-sitter-python` |
+| R        | `r`       | `.r`, `.R` | `tree-sitter-r` |
+| Perl     | `perl`    | `.pl`, `.pm`, `.t` | `tree-sitter-perl-next` |
+| Fortran  | `fortran` | `.f`, `.f90`, `.f95`, `.f03`, `.f08`, `.for`, `.ftn` | `tree-sitter-fortran` |
+
+Language is auto-detected from file extension when `-l` is omitted. Cross-language compare works across any pair (see the earlier minimap2 and fastqc-rs examples — both Rust↔C and Rust↔Java).
+
+### Per-language notes
+
+- **Rust**: `#[no_mangle]` / `#[link_name = "..."]` extracted into `original_name` so FFI bindings match the foreign symbol automatically.
+- **C/C++**: treats both `goto` and `gnu_asm_expression` as signals; `asm!` / inline asm lines counted separately as `loc_asm`.
+- **Java**: method polymorphism (same method name across many classes) produces many same-name matches; use a mapping file to disambiguate.
+- **Python**: `elif_clause` counted flat, not nested. `yield` / `raise_statement` both count as early returns.
+- **R**: functions are anonymous; the name comes from the enclosing `<-` / `=` / `->` assignment. `||`/`&&`/`|`/`&` all treated as short-circuit for cyclomatic purposes.
+- **Perl**: `last` / `next` / `redo` classified as `goto_count` (they're non-local jumps). `elsif` is a flat decision. POD blocks count as comments.
+- **Fortran**: `elseif_clause` / `elsewhere_clause` / `case_statement` arms all flat. `cycle` / `exit` → goto, `return` → return, `stop` → return.
+
 ## CLI reference
 
 `ccc-rs <subcommand>`
 
 | Subcommand        | Purpose |
 |-------------------|---------|
-| `analyze <path>`  | Parse a file or directory into a JSON `Report`. `-l c|cpp|rust` forces language, otherwise inferred from extension. `--recurse` walks directories. `-o file.json` writes to disk (else stdout). |
+| `analyze <path>`  | Parse a file or directory into a JSON `Report`. `-l c|cpp|rust|java|python|r|perl|fortran` forces language, otherwise inferred from extension. `--recurse` walks directories. `-o file.json` writes to disk (else stdout). |
 | `compare <rust.json> <other.json>` | Matches functions and lists top deviations. Output columns read `metric(other_value -> rust_value Δ=weighted_contribution)`. Flags: `--mapping map.toml`, `--top N`, `--format table|json`. |
 | `missing <rust.json> <other.json>` | Functions in C not matched to anything in Rust (plus "partial" — matched but Rust LOC is a stub-sized fraction of C). `--stub-loc-ratio 0.2` (default). |
 | `sort <report.json>` | Sort functions in one report. `--by cognitive|cyclomatic|combined-nesting|loc|halstead-difficulty|combined-nesting-x-loc|composite` (default `composite` = z-score sum). |
@@ -101,7 +126,7 @@ Top level `Report`:
 ```json
 {
   "schema_version": 1,
-  "language": "c" | "cpp" | "rust" | "java" | "python" | "r" | "unknown",
+  "language": "c" | "cpp" | "rust" | "java" | "python" | "r" | "perl" | "fortran" | "unknown",
   "source_file": "path/to/file",
   "source_hash": "16-hex-char FNV-1a",
   "functions": [FunctionAnalysis, ...]
@@ -148,8 +173,13 @@ src/main.rs          CLI (binary "ccc-rs")
 src/core.rs          shared types, JSON schema, versioning
 src/analyzer.rs      LanguageAnalyzer trait + Registry
 src/walker.rs        generic tree-sitter visitor + LanguageSpec trait
-src/lang_c.rs        C/C++ analyzer (tree-sitter-c, tree-sitter-cpp)
-src/lang_rust.rs     Rust analyzer (tree-sitter-rust)
+src/lang_c.rs        C/C++ analyzer
+src/lang_rust.rs     Rust analyzer
+src/lang_java.rs     Java analyzer
+src/lang_python.rs   Python analyzer
+src/lang_r.rs        R analyzer
+src/lang_perl.rs     Perl analyzer
+src/lang_fortran.rs  Fortran analyzer
 src/compare/         matching, deviation, constants_diff, sort
 src/predict/         OLS linear model + heuristic rules
 ```
@@ -202,7 +232,7 @@ struct Metrics {
     cognitive: u32,         // Sonar-style; penalizes nesting
     halstead: Halstead,     // n1,n2,N1,N2 → volume, difficulty
     early_returns: u32,
-    goto_count: u32,        // C only; signals translation risk
+    goto_count: u32,        // goto (C), cycle/exit (Fortran), last/next/redo (Perl) — non-local jumps
     unsafe_blocks: u32,     // Rust only
 }
 ```
@@ -313,7 +343,7 @@ The model outputs **predicted Rust metrics + residual std** per function. When a
 
 Train with OLS (use `linfa` or `nalgebra` + closed-form) — keeps the model interpretable and the coefficients inspectable as JSON.
 
-### Extensibility for Java / R / Python
+### Extending to more languages
 
 The only per-language work is:
 1. A tree-sitter grammar dependency.
@@ -321,7 +351,7 @@ The only per-language work is:
 3. Optional language-specific attributes in the `attributes` bag.
 4. Optional heuristic rules in the prediction model.
 
-Compare/sort/diff/predict commands work unchanged because they consume only the shared JSON schema.
+Compare/sort/diff/predict commands work unchanged because they consume only the shared JSON schema. Java, Python, R, Perl, and Fortran were each added as a single `src/lang_<name>.rs` file following this pattern.
 
 ### A few things worth calling out
 
