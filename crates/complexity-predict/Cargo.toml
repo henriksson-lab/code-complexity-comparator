@@ -1,0 +1,13 @@
+[package]
+name = "complexity-predict"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+complexity-core = { workspace = true }
+complexity-compare = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+nalgebra = { workspace = true }

@@ -1,0 +1,21 @@
+[package]
+name = "complexity-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "complexity"
+path = "src/main.rs"
+
+[dependencies]
+complexity-core = { workspace = true }
+complexity-analyzer = { workspace = true }
+complexity-lang-c = { workspace = true }
+complexity-lang-rust = { workspace = true }
+complexity-compare = { workspace = true }
+complexity-predict = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
