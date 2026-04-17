@@ -1,19 +1,24 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use complexity::analyzer::{LanguageAnalyzer, Registry};
-use complexity::compare::{
+use code_complexity_comparator_rs::analyzer::{LanguageAnalyzer, Registry};
+use code_complexity_comparator_rs::compare::{
     constants_diff, deviation_rows, load_report, match_reports, missing, sort_report, Mapping,
     SortKey, Weights,
 };
-use complexity::core::{Language, Report};
-use complexity::lang_c::CAnalyzer;
-use complexity::lang_rust::RustAnalyzer;
-use complexity::predict::{predict_report, train, Model};
+use code_complexity_comparator_rs::core::{Language, Report};
+use code_complexity_comparator_rs::lang_c::CAnalyzer;
+use code_complexity_comparator_rs::lang_java::JavaAnalyzer;
+use code_complexity_comparator_rs::lang_python::PythonAnalyzer;
+use code_complexity_comparator_rs::lang_fortran::FortranAnalyzer;
+use code_complexity_comparator_rs::lang_perl::PerlAnalyzer;
+use code_complexity_comparator_rs::lang_r::RAnalyzer;
+use code_complexity_comparator_rs::lang_rust::RustAnalyzer;
+use code_complexity_comparator_rs::predict::{predict_report, train, Model};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
-#[command(name = "complexity", about = "Static complexity analysis and cross-language comparison")]
+#[command(name = "ccc-rs", about = "Static complexity analysis and cross-language comparison")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -112,6 +117,11 @@ enum LangArg {
     C,
     Cpp,
     Rust,
+    Java,
+    Python,
+    R,
+    Perl,
+    Fortran,
 }
 
 impl LangArg {
@@ -120,6 +130,11 @@ impl LangArg {
             LangArg::C => Language::C,
             LangArg::Cpp => Language::Cpp,
             LangArg::Rust => Language::Rust,
+            LangArg::Java => Language::Java,
+            LangArg::Python => Language::Python,
+            LangArg::R => Language::R,
+            LangArg::Perl => Language::Perl,
+            LangArg::Fortran => Language::Fortran,
         }
     }
 }
@@ -141,6 +156,11 @@ fn build_registry() -> Registry {
     r.register(Box::new(CAnalyzer::c()));
     r.register(Box::new(CAnalyzer::cpp()));
     r.register(Box::new(RustAnalyzer::new()));
+    r.register(Box::new(JavaAnalyzer::new()));
+    r.register(Box::new(PythonAnalyzer::new()));
+    r.register(Box::new(RAnalyzer::new()));
+    r.register(Box::new(PerlAnalyzer::new()));
+    r.register(Box::new(FortranAnalyzer::new()));
     r
 }
 
@@ -188,7 +208,7 @@ fn cmd_analyze(path: &Path, lang: Option<LangArg>, out: Option<&Path>, recurse: 
         reports.pop().unwrap()
     } else {
         let mut r = Report {
-            schema_version: complexity::core::SCHEMA_VERSION,
+            schema_version: code_complexity_comparator_rs::core::SCHEMA_VERSION,
             language: reports.first().map(|r| r.language).unwrap_or(Language::Unknown),
             source_file: path.to_path_buf(),
             source_hash: String::new(),

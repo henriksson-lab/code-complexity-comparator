@@ -409,15 +409,26 @@ fn walk<S: LanguageSpec>(
 
     match class {
         NodeClass::If => {
-            // `else if` appears as an if_statement whose parent is an
-            // else_clause. Treat it as a continuation of the surrounding if,
-            // not a new nesting level: count +1 cyclomatic/branch, but don't
-            // bump depth — else chained `else if` pyramids appear as arbitrary
-            // nesting, which is wrong.
-            let is_else_if = node
-                .parent()
-                .map(|p| matches!(p.kind(), "else_clause" | "else"))
-                .unwrap_or(false);
+            // `else if` must not bump nesting depth. Grammars model it
+            // differently:
+            //   - C/C++ wraps the chained if inside an `else_clause` node.
+            //   - Java and many others put the nested `if_statement` directly
+            //     as the `alternative` field of the parent if.
+            //   - Rust does the same via `if_expression`.
+            // Treat all three as a continuation, not a new level.
+            let is_else_if = match node.parent() {
+                Some(p) => {
+                    matches!(p.kind(), "else_clause" | "else")
+                        || (matches!(
+                            p.kind(),
+                            "if_statement" | "if_expression" | "if_let_expression"
+                        ) && p
+                            .child_by_field_name("alternative")
+                            .map(|alt| alt.id() == node.id())
+                            .unwrap_or(false))
+                }
+                None => false,
+            };
             acc.branches += 1;
             acc.cyclomatic += 1;
             if is_else_if {

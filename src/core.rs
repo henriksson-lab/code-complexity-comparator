@@ -13,6 +13,8 @@ pub enum Language {
     Java,
     Python,
     R,
+    Perl,
+    Fortran,
     Unknown,
 }
 
@@ -25,6 +27,8 @@ impl Language {
             "java" => Language::Java,
             "py" => Language::Python,
             "r" => Language::R,
+            "pl" | "pm" | "t" => Language::Perl,
+            "f" | "f90" | "f95" | "f03" | "f08" | "for" | "ftn" => Language::Fortran,
             _ => Language::Unknown,
         }
     }
@@ -37,6 +41,8 @@ impl Language {
             Language::Java => "java",
             Language::Python => "python",
             Language::R => "r",
+            Language::Perl => "perl",
+            Language::Fortran => "fortran",
             Language::Unknown => "unknown",
         }
     }

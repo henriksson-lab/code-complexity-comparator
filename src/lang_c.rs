@@ -32,11 +32,11 @@ impl LanguageAnalyzer for CAnalyzer {
         let mut parser = Parser::new();
         if self.cpp {
             parser
-                .set_language(&tree_sitter_cpp::language())
+                .set_language(&tree_sitter_cpp::LANGUAGE.into())
                 .map_err(|e| anyhow!("set language cpp: {}", e))?;
         } else {
             parser
-                .set_language(&tree_sitter_c::language())
+                .set_language(&tree_sitter_c::LANGUAGE.into())
                 .map_err(|e| anyhow!("set language c: {}", e))?;
         }
         let tree = parser.parse(src, None).ok_or_else(|| anyhow!("parse failed"))?;

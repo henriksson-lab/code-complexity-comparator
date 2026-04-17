@@ -24,7 +24,7 @@ impl LanguageAnalyzer for RustAnalyzer {
     fn analyze_source(&self, src: &str, path: &Path) -> Result<Report> {
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_rust::language())
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
             .map_err(|e| anyhow!("set language rust: {}", e))?;
         let tree = parser.parse(src, None).ok_or_else(|| anyhow!("parse failed"))?;
         let src_bytes = src.as_bytes();
