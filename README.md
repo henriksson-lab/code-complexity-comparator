@@ -2,24 +2,152 @@
 
 Static complexity analysis and cross-language comparison for C/C++, Rust, and (future) Java, R, Python. Built to catch bugs and incomplete translations between an original codebase and its Rust port.
 
-## Design: `complexity-cmp`
+## Quickstart
 
-### Workspace layout (cargo workspace)
+```sh
+cargo build --release
+# The binary lives at target/release/complexity
+
+# 1. Analyze a C tree and a Rust tree into JSON reports.
+./target/release/complexity analyze path/to/c_src   -l c    --recurse -o c.json
+./target/release/complexity analyze path/to/rust_src -l rust --recurse -o rust.json
+
+# 2. Compare, sorted by deviation (most concerning first).
+./target/release/complexity compare rust.json c.json --top 25
+
+# 3. List C functions with no Rust counterpart (and partial/stubbed matches).
+./target/release/complexity missing rust.json c.json
+
+# 4. Rank functions within one report by complexity.
+./target/release/complexity sort c.json --by composite --top 25
+
+# 5. Diff constants (magic numbers, strings) per matched function.
+./target/release/complexity constants-diff rust.json c.json
+
+# 6. Train a linear+heuristic model and predict Rust metrics from C metrics.
+./target/release/complexity predict train pairs_dir/ --model model.json
+./target/release/complexity predict apply --model model.json --source c.json --against rust.json
+```
+
+`pairs_dir/` for training must contain files named `<base>.rust.json` and `<base>.c.json` (or `.cpp.json`) for each matched pair.
+
+## CLI reference
+
+`complexity <subcommand>`
+
+| Subcommand        | Purpose |
+|-------------------|---------|
+| `analyze <path>`  | Parse a file or directory into a JSON `Report`. `-l c|cpp|rust` forces language, otherwise inferred from extension. `--recurse` walks directories. `-o file.json` writes to disk (else stdout). |
+| `compare <rust.json> <other.json>` | Matches functions and lists top deviations. Output columns read `metric(other_value -> rust_value Δ=weighted_contribution)`. Flags: `--mapping map.toml`, `--top N`, `--format table|json`. |
+| `missing <rust.json> <other.json>` | Functions in C not matched to anything in Rust (plus "partial" — matched but Rust LOC is a stub-sized fraction of C). `--stub-loc-ratio 0.2` (default). |
+| `sort <report.json>` | Sort functions in one report. `--by cognitive|cyclomatic|combined-nesting|loc|halstead-difficulty|combined-nesting-x-loc|composite` (default `composite` = z-score sum). |
+| `constants-diff <rust.json> <other.json>` | Per matched pair, shows integer/float/string/char/bool constants present on only one side. Ranked by divergence score. |
+| `predict train <pairs_dir> --model model.json` | Fits one linear model per target metric via closed-form OLS over matched pairs. |
+| `predict apply --model model.json --source c.json [--against rust.json]` | Predicts expected Rust metrics from C; with `--against`, also reports z-scores of actual-minus-predicted for outlier detection. |
+
+### Mapping file
+
+When names don't match cleanly across the port, provide a mapping (TOML or JSON):
+
+```toml
+# map.toml
+[[entries]]
+rust  = "parse_header"
+other = "mm_parse_header"
+
+[[entries]]
+rust  = "Aligner::map_frag"
+other = "mm_map_frag_core"
+```
+
+`--mapping map.toml` is accepted by `compare`, `missing`, `constants-diff`, and `predict apply`.
+
+### Matching strategies
+
+Functions are matched Rust ↔ other, in priority order. The chosen strategy is recorded per pair:
+
+1. **Mapping** — explicit entry in the mapping file.
+2. **FfiAttribute** — Rust `#[no_mangle]` or `#[link_name = "…"]` equals the other-language function name. Extracted into the Rust report's `original_name` field.
+3. **ExactName** — identical names.
+4. **Normalized** — snake/camelCase folded, trivial suffixes like `_impl`, `_inner`, `_rs`, `_c` stripped.
+5. **Fingerprint** — same `(arity, return_count, log2(loc))` *and* a shared token of ≥ 4 chars. Deliberately conservative; spurious matches from short names were the #1 noise source.
+
+### Metrics emitted per function
+
+Stored in `FunctionAnalysis.metrics`:
+
+- `loc_code`, `loc_comments`, `loc_asm` — lines attributed to code, comments, inline asm respectively.
+- `inputs`, `outputs` — parameter count, return arity (tuple/out-params flattened).
+- `branches`, `loops` — raw counts.
+- `max_loop_nesting`, `max_if_nesting`, `max_combined_nesting`.
+- `calls_unique`, `calls_total`.
+- `cyclomatic` — McCabe, base 1 + one per decision point.
+- `cognitive` — Sonar-style; penalizes nesting; else-if chains do **not** compound (fixed bug).
+- `halstead` — `{n1, n2, big_n1, big_n2, volume, difficulty}`.
+- `early_returns`, `goto_count`, `unsafe_blocks`.
+
+Also captured per function: `constants` (each with kind, textual form, parsed value, byte span), `calls` (callee name, count, span), `types_used`, `signature`, `attributes` (free-form language-specific bag: `static`, `inline`, `no_mangle`, `cfg`, etc.).
+
+## JSON schema
+
+Top level `Report`:
+```json
+{
+  "schema_version": 1,
+  "language": "c" | "cpp" | "rust" | "java" | "python" | "r" | "unknown",
+  "source_file": "path/to/file",
+  "source_hash": "16-hex-char FNV-1a",
+  "functions": [FunctionAnalysis, ...]
+}
+```
+
+`Constant` is tagged:
+```json
+{"kind": "int",    "value": 255,  "text": "0xFF", "span": [start, end]}
+{"kind": "float",  "value": 3.14, "text": "3.14", "span": [start, end]}
+{"kind": "string", "value": "hi", "span": [start, end]}
+{"kind": "char",   "value": "\\n", "span": [start, end]}
+{"kind": "bool",   "value": true, "span": [start, end]}
+```
+
+`schema_version` is a breaking-change gate — bump it when fields are removed or semantics change.
+
+## Adding a new language
+
+1. Add a module `src/lang_<name>.rs` following `src/lang_c.rs` as a template. Declare it in `src/lib.rs`.
+2. Add the matching tree-sitter grammar to `Cargo.toml` (e.g. `tree-sitter-java`).
+3. Implement `walker::LanguageSpec` — map tree-sitter node kinds to `NodeClass`, and provide `function_name`, `call_callee`, `signature`, optionally `original_name` / `attributes`.
+4. Implement `analyzer::LanguageAnalyzer` — parse with tree-sitter, call `walker::collect_functions` then `walker::analyze_function` per node, then `walker::finalize_early_returns`.
+5. Register in `src/main.rs::build_registry()` and add a `LangArg` variant.
+
+The walker is language-agnostic; you only tell it how to classify nodes.
+
+## Known limitations
+
+- **Tree-sitter sees tokens, not semantics.** C macros, templates, and preprocessor-heavy code produce approximate metrics. A `static inline` function in a SIMD header like `_mm_setzero_si128` shows up as a regular function. Filter these out by path or attribute when auditing.
+- **`call_expression` callee naming is language-specific.** For Rust, `foo::bar::baz()` is reduced to `baz`, `"s".into()` to `into`, `x.y()` to `y`. Use spans if you need the original text.
+- **Fingerprint matching is conservative by design.** Functions without clear name overlap go to the `missing` list even if they are real translations. Provide a mapping file for those.
+- **Prediction model is per-metric OLS with a small ridge term.** With few training pairs the residuals are tiny (near-memorization); add more pairs for meaningful z-scores.
+- Integer constants are stored as `i64` (not `i128`) because `serde_json` can't round-trip `i128` without extra features. Oversized C constants are wrapped.
+
+## Design: `complexity`
+
+### Crate layout (single package)
 
 ```
-complexity-core/      shared types, JSON schema, versioning
-complexity-analyzer/  LanguageAnalyzer trait + registry
-complexity-lang-c/    C/C++ (tree-sitter-c, tree-sitter-cpp)
-complexity-lang-rust/ Rust (syn OR tree-sitter-rust)
-complexity-lang-java/ future
-complexity-lang-py/   future
-complexity-lang-r/    future
-complexity-compare/   matching, deviation, diffing
-complexity-predict/   linear + heuristic model
-complexity-cli/       binary
+Cargo.toml
+src/lib.rs           public module list
+src/main.rs          CLI (binary "complexity")
+src/core.rs          shared types, JSON schema, versioning
+src/analyzer.rs      LanguageAnalyzer trait + Registry
+src/walker.rs        generic tree-sitter visitor + LanguageSpec trait
+src/lang_c.rs        C/C++ analyzer (tree-sitter-c, tree-sitter-cpp)
+src/lang_rust.rs     Rust analyzer (tree-sitter-rust)
+src/compare/         matching, deviation, constants_diff, sort
+src/predict/         OLS linear model + heuristic rules
 ```
 
-One crate per language keeps the matrix open: adding Java means implementing one trait.
+Adding a new language means one new `lang_<name>.rs` that implements `LanguageSpec`, plus a registry entry.
 
 ### Parsing
 

@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
-use complexity_compare::{match_reports, metric_vector, Mapping};
-use complexity_core::{FunctionAnalysis, Metrics, Report};
+use crate::compare::{match_reports, metric_vector, Mapping};
+use crate::core::{FunctionAnalysis, Metrics, Report};
 use nalgebra::{DMatrix, DVector};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

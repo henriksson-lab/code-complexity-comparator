@@ -1,5 +1,5 @@
-use crate::matching::MatchResult;
-use complexity_core::{Constant, FunctionAnalysis};
+use crate::compare::matching::MatchResult;
+use crate::core::{Constant, FunctionAnalysis};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

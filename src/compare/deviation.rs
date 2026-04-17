@@ -1,5 +1,5 @@
-use crate::{matching::MatchResult, metric_vector};
-use complexity_core::Report;
+use crate::compare::{matching::MatchResult, metric_vector};
+use crate::core::Report;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

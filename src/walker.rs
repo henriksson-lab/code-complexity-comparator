@@ -2,7 +2,7 @@
 //! classify tree-sitter nodes; the walker handles nesting, accumulation and
 //! final metric computation uniformly across languages.
 
-use complexity_core::{Call, Constant, FunctionAnalysis, Halstead, Location, Metrics, Signature, TypeRef};
+use crate::core::{Call, Constant, FunctionAnalysis, Halstead, Location, Metrics, Signature, TypeRef};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use tree_sitter::Node;
@@ -409,14 +409,27 @@ fn walk<S: LanguageSpec>(
 
     match class {
         NodeClass::If => {
+            // `else if` appears as an if_statement whose parent is an
+            // else_clause. Treat it as a continuation of the surrounding if,
+            // not a new nesting level: count +1 cyclomatic/branch, but don't
+            // bump depth — else chained `else if` pyramids appear as arbitrary
+            // nesting, which is wrong.
+            let is_else_if = node
+                .parent()
+                .map(|p| matches!(p.kind(), "else_clause" | "else"))
+                .unwrap_or(false);
             acc.branches += 1;
             acc.cyclomatic += 1;
-            new_if = if_d + 1;
-            new_comb = comb_d + 1;
-            acc.max_if = acc.max_if.max(new_if);
-            acc.max_comb = acc.max_comb.max(new_comb);
-            acc.cognitive += 1 + cog_nesting;
-            new_cog = cog_nesting + 1;
+            if is_else_if {
+                acc.cognitive += 1;
+            } else {
+                new_if = if_d + 1;
+                new_comb = comb_d + 1;
+                acc.max_if = acc.max_if.max(new_if);
+                acc.max_comb = acc.max_comb.max(new_comb);
+                acc.cognitive += 1 + cog_nesting;
+                new_cog = cog_nesting + 1;
+            }
         }
         NodeClass::Else => {
             acc.cognitive += 1;

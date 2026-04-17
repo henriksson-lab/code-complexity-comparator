@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
-use complexity_analyzer::walker::{analyze_function, collect_functions, finalize_early_returns, LanguageSpec, NodeClass};
-use complexity_analyzer::LanguageAnalyzer;
-use complexity_core::{hash_source, Language, Param, Report, Signature, TypeRef};
+use crate::walker::{analyze_function, collect_functions, finalize_early_returns, LanguageSpec, NodeClass};
+use crate::analyzer::LanguageAnalyzer;
+use crate::core::{hash_source, Language, Param, Report, Signature, TypeRef};
 use std::collections::BTreeMap;
 use std::path::Path;
 use tree_sitter::{Node, Parser};
@@ -100,9 +100,35 @@ impl LanguageSpec for RustSpec {
         match node.kind() {
             "call_expression" => {
                 let f = node.child_by_field_name("function")?;
-                // strip generic args and paths to last segment
-                let text = f.utf8_text(src).ok()?;
-                Some(strip_generics(text).to_string())
+                match f.kind() {
+                    // `"s".into()` and friends are `call_expression` where the
+                    // function is a field_expression. Use just the field name.
+                    "field_expression" => f
+                        .child_by_field_name("field")
+                        .and_then(|n| n.utf8_text(src).ok())
+                        .map(|s| s.to_string()),
+                    // `foo::bar::baz()` -> `baz`
+                    "scoped_identifier" => {
+                        let text = f.utf8_text(src).ok()?;
+                        Some(
+                            strip_generics(text)
+                                .rsplit("::")
+                                .next()
+                                .unwrap_or("")
+                                .to_string(),
+                        )
+                    }
+                    _ => {
+                        let text = f.utf8_text(src).ok()?;
+                        // Collapse whitespace/newlines that appear when the
+                        // callee spans multiple lines.
+                        let cleaned: String = strip_generics(text)
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        Some(cleaned)
+                    }
+                }
             }
             "method_call_expression" => {
                 let m = node.child_by_field_name("method")?;

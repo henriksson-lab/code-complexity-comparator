@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use complexity_core::{FunctionAnalysis, Report};
+use crate::core::{FunctionAnalysis, Report};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -152,8 +152,10 @@ pub fn match_reports<'a>(
         }
     }
 
-    // 5. Fingerprint fallback: for unmatched, pick nearest by (arity, loc bucket).
-    //   Only match if fingerprint distance is exact to avoid spurious pairs.
+    // 5. Fingerprint fallback: only when names share a substantial token.
+    //   Short names ("w", "k", "map") are common as builder methods or
+    //   accessors and produce too many spurious matches, so require the
+    //   shared token to be >= 4 chars and the fingerprints to match exactly.
     let r_unmatched: Vec<usize> = (0..rust.functions.len())
         .filter(|i| !used_rust.contains(i))
         .collect();
@@ -163,14 +165,17 @@ pub fn match_reports<'a>(
     for &ri in &r_unmatched {
         let rf = &rust.functions[ri];
         let fp_r = fingerprint(rf);
+        let rtoks = tokenize_name(&rf.name);
         for &oi in &o_unmatched {
             if used_other.contains(&oi) {
                 continue;
             }
             let of = &other.functions[oi];
-            if fp_r == fingerprint(of) && normalize_name(&rf.name).contains(&normalize_name(&of.name))
-                || normalize_name(&of.name).contains(&normalize_name(&rf.name))
-            {
+            if fp_r != fingerprint(of) {
+                continue;
+            }
+            let otoks = tokenize_name(&of.name);
+            if shared_substantial_token(&rtoks, &otoks) {
                 used_rust.insert(ri);
                 used_other.insert(oi);
                 pairs.push(Pair {
@@ -205,6 +210,24 @@ pub fn normalize_name(name: &str) -> String {
         .filter(|p| !matches!(*p, "impl" | "inner" | "helper" | "rs" | "c" | "cpp"))
         .collect();
     parts.join("_")
+}
+
+fn tokenize_name(name: &str) -> Vec<String> {
+    normalize_name(name).split('_').map(|s| s.to_string()).collect()
+}
+
+fn shared_substantial_token(a: &[String], b: &[String]) -> bool {
+    for ta in a {
+        if ta.len() < 4 {
+            continue;
+        }
+        for tb in b {
+            if ta == tb {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn fingerprint(f: &FunctionAnalysis) -> (u32, u32, u32) {

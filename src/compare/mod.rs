@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use complexity_core::{Constant, FunctionAnalysis, Language, Metrics, Report};
+use crate::core::{Constant, FunctionAnalysis, Language, Metrics, Report};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;

@@ -1,9 +1,6 @@
 use anyhow::Result;
-use complexity_core::{Language, Report};
+use crate::core::{Language, Report};
 use std::path::Path;
-
-pub mod walker;
-pub use walker::{analyze_function, collect_functions, find_kind_text, LanguageSpec, NodeClass};
 
 pub trait LanguageAnalyzer: Send + Sync {
     fn language(&self) -> Language;

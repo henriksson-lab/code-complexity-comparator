@@ -1,4 +1,4 @@
-use complexity_core::FunctionAnalysis;
+use crate::core::FunctionAnalysis;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 

@@ -1,14 +1,14 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use complexity_analyzer::{LanguageAnalyzer, Registry};
-use complexity_compare::{
+use complexity::analyzer::{LanguageAnalyzer, Registry};
+use complexity::compare::{
     constants_diff, deviation_rows, load_report, match_reports, missing, sort_report, Mapping,
     SortKey, Weights,
 };
-use complexity_core::{Language, Report};
-use complexity_lang_c::CAnalyzer;
-use complexity_lang_rust::RustAnalyzer;
-use complexity_predict::{predict_report, train, Model};
+use complexity::core::{Language, Report};
+use complexity::lang_c::CAnalyzer;
+use complexity::lang_rust::RustAnalyzer;
+use complexity::predict::{predict_report, train, Model};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -188,7 +188,7 @@ fn cmd_analyze(path: &Path, lang: Option<LangArg>, out: Option<&Path>, recurse: 
         reports.pop().unwrap()
     } else {
         let mut r = Report {
-            schema_version: complexity_core::SCHEMA_VERSION,
+            schema_version: complexity::core::SCHEMA_VERSION,
             language: reports.first().map(|r| r.language).unwrap_or(Language::Unknown),
             source_file: path.to_path_buf(),
             source_hash: String::new(),

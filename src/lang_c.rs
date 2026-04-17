@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
-use complexity_analyzer::walker::{analyze_function, collect_functions, finalize_early_returns, LanguageSpec, NodeClass};
-use complexity_analyzer::LanguageAnalyzer;
-use complexity_core::{hash_source, Language, Param, Report, Signature, TypeRef};
+use crate::walker::{analyze_function, collect_functions, finalize_early_returns, LanguageSpec, NodeClass};
+use crate::analyzer::LanguageAnalyzer;
+use crate::core::{hash_source, Language, Param, Report, Signature, TypeRef};
 use std::collections::BTreeMap;
 use std::path::Path;
 use tree_sitter::{Node, Parser};

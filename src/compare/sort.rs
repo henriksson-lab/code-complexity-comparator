@@ -1,4 +1,4 @@
-use complexity_core::{FunctionAnalysis, Metrics, Report};
+use crate::core::{FunctionAnalysis, Metrics, Report};
 
 #[derive(Debug, Clone, Copy)]
 pub enum SortKey {
