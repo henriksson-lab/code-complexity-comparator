@@ -32,6 +32,8 @@ nalgebra = "0.33"
 toml = "0.8"
 tree-sitter-perl-next = "0.1.0"
 tree-sitter-fortran = "0.5.1"
+ratatui = "0.29"
+crossterm = "0.28"
 
 [profile.release]
 lto = "thin"

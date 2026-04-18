@@ -123,6 +123,22 @@ enum Cmd {
         #[command(subcommand)]
         sub: PredictCmd,
     },
+    /// Open a split-screen TUI to compare Rust functions against their
+    /// original-language counterparts. The mapping file drives the pair list;
+    /// file paths are resolved by scanning the given roots (file name must
+    /// match, full path is flexible).
+    CompareTui {
+        #[arg(long, default_value = "ccc_mapping.toml")]
+        mapping: PathBuf,
+        #[arg(long, default_value = ".")]
+        rust_root: PathBuf,
+        #[arg(long)]
+        other_root: PathBuf,
+        /// Auto-detected from the most common non-Rust source extension under
+        /// `--other-root` when omitted.
+        #[arg(long)]
+        other_lang: Option<LangArg>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -188,6 +204,19 @@ enum SortArg {
     Name,
 }
 
+const DEFAULT_MAPPING: &str = "ccc_mapping.toml";
+
+/// Use the user-supplied path when given; otherwise fall back to
+/// `ccc_mapping.toml` in the working directory if it exists. Returning
+/// `None` keeps the "no mapping" behavior intact when neither is present.
+fn resolve_mapping(explicit: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(p) = explicit {
+        return Some(p);
+    }
+    let default = PathBuf::from(DEFAULT_MAPPING);
+    default.exists().then_some(default)
+}
+
 fn build_registry() -> Registry {
     let mut r = Registry::new();
     r.register(Box::new(CAnalyzer::c()));
@@ -206,31 +235,58 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Analyze { path, lang, out, recurse } => cmd_analyze(&path, lang, out.as_deref(), recurse),
         Cmd::Compare { rust, other, mapping, sort, top, format } => {
+            let mapping = resolve_mapping(mapping);
             cmd_compare(&rust, &other, mapping.as_deref(), sort, top, format)
         }
         Cmd::Missing { rust, other, mapping, stub_loc_ratio, format } => {
+            let mapping = resolve_mapping(mapping);
             cmd_missing(&rust, &other, mapping.as_deref(), stub_loc_ratio, format)
         }
         Cmd::Sort { report, by, top, format } => cmd_sort(&report, &by, top, format),
         Cmd::ConstantsDiff { rust, other, mapping, top, format } => {
+            let mapping = resolve_mapping(mapping);
             cmd_constants_diff(&rust, &other, mapping.as_deref(), top, format)
         }
         Cmd::Order { path, lang, recurse, out, strict, merge } => {
             cmd_order(&path, lang, recurse, out.as_deref(), strict, merge.as_deref())
         }
         Cmd::OrderAnnotate { csv, source, rust, mapping, out } => {
+            let mapping = resolve_mapping(mapping);
             cmd_order_annotate(&csv, &source, &rust, mapping.as_deref(), out.as_deref())
         }
         Cmd::Predict { sub } => match sub {
             PredictCmd::Train { pairs_dir, model } => cmd_predict_train(&pairs_dir, &model),
-            PredictCmd::Apply { model, source, against, mapping, out } => cmd_predict_apply(
-                &model,
-                &source,
-                against.as_deref(),
-                mapping.as_deref(),
-                out.as_deref(),
-            ),
+            PredictCmd::Apply { model, source, against, mapping, out } => {
+                let mapping = resolve_mapping(mapping);
+                cmd_predict_apply(
+                    &model,
+                    &source,
+                    against.as_deref(),
+                    mapping.as_deref(),
+                    out.as_deref(),
+                )
+            }
         },
+        Cmd::CompareTui { mapping, rust_root, other_root, other_lang } => {
+            let lang = match other_lang {
+                Some(l) => l.to_language(),
+                None => {
+                    let detected = code_complexity_comparator_rs::tui::detect_other_language(&other_root)
+                        .ok_or_else(|| anyhow!(
+                            "could not detect source language under {} — pass --other-lang",
+                            other_root.display()
+                        ))?;
+                    eprintln!("auto-detected other-lang: {}", detected.as_str());
+                    detected
+                }
+            };
+            code_complexity_comparator_rs::tui::run(code_complexity_comparator_rs::tui::Args {
+                mapping,
+                rust_root,
+                other_root,
+                other_lang: lang,
+            })
+        }
     }
 }
 

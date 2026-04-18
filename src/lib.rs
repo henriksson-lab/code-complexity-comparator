@@ -11,3 +11,4 @@ pub mod lang_fortran;
 pub mod compare;
 pub mod order;
 pub mod predict;
+pub mod tui;
