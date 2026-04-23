@@ -2,8 +2,9 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use code_complexity_comparator_rs::analyzer::{LanguageAnalyzer, Registry};
 use code_complexity_comparator_rs::compare::{
-    constants_diff, deviation_rows, load_report, match_reports, match_structs, missing,
-    sort_report, struct_deviation_rows, struct_missing, Mapping, SortKey, Weights,
+    analyze_upstream, constants_diff, deviation_rows, load_report, match_reports, match_structs,
+    missing, sort_report, struct_deviation_rows, struct_missing, FunctionSelector, Mapping,
+    SortKey, Weights,
 };
 use code_complexity_comparator_rs::core::{Language, Report};
 use code_complexity_comparator_rs::lang_c::CAnalyzer;
@@ -161,6 +162,37 @@ enum Cmd {
         #[arg(long)]
         other_lang: Option<LangArg>,
     },
+    /// Compare the recursive upstream caller sets for a Rust and/or
+    /// original-language function, then flag pairing mismatches across the
+    /// two sets and rank the translated pairs by complexity mismatch.
+    Upstream {
+        rust: PathBuf,
+        other: PathBuf,
+        #[arg(long)]
+        mapping: Option<PathBuf>,
+        #[arg(long = "rust-fn")]
+        rust_fn: Option<String>,
+        #[arg(long = "rust-path")]
+        rust_path: Option<String>,
+        #[arg(long = "rust-line")]
+        rust_line: Option<u32>,
+        #[arg(long = "rust-class")]
+        rust_class: Option<String>,
+        #[arg(long = "other-fn")]
+        other_fn: Option<String>,
+        #[arg(long = "other-path")]
+        other_path: Option<String>,
+        #[arg(long = "other-line")]
+        other_line: Option<u32>,
+        #[arg(long = "other-class")]
+        other_class: Option<String>,
+        /// Drop ambiguous call edges instead of conservatively treating every
+        /// same-named candidate as a caller/callee.
+        #[arg(long)]
+        strict: bool,
+        #[arg(long, default_value = "table")]
+        format: FormatArg,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -316,6 +348,44 @@ fn main() -> Result<()> {
                 other_root,
                 other_lang: lang,
             })
+        }
+        Cmd::Upstream {
+            rust,
+            other,
+            mapping,
+            rust_fn,
+            rust_path,
+            rust_line,
+            rust_class,
+            other_fn,
+            other_path,
+            other_line,
+            other_class,
+            strict,
+            format,
+        } => {
+            let mapping = resolve_mapping(mapping);
+            let rust_selector = FunctionSelector {
+                name: rust_fn,
+                path: rust_path,
+                line: rust_line,
+                class: rust_class,
+            };
+            let other_selector = FunctionSelector {
+                name: other_fn,
+                path: other_path,
+                line: other_line,
+                class: other_class,
+            };
+            cmd_upstream(
+                &rust,
+                &other,
+                mapping.as_deref(),
+                if rust_selector.is_empty() { None } else { Some(&rust_selector) },
+                if other_selector.is_empty() { None } else { Some(&other_selector) },
+                strict,
+                format,
+            )
         }
     }
 }
@@ -798,6 +868,105 @@ fn cmd_order_annotate(
         eprintln!("wrote {}", p.display());
     } else {
         print!("{}", s);
+    }
+    Ok(())
+}
+
+fn cmd_upstream(
+    rust: &Path,
+    other: &Path,
+    mapping: Option<&Path>,
+    rust_selector: Option<&FunctionSelector>,
+    other_selector: Option<&FunctionSelector>,
+    strict: bool,
+    format: FormatArg,
+) -> Result<()> {
+    let rust_r = load_report(rust)?;
+    let other_r = load_report(other)?;
+    let map = mapping.map(Mapping::load).transpose()?;
+    let matches = match_reports(&rust_r, &other_r, map.as_ref());
+    let analysis = analyze_upstream(
+        &rust_r,
+        &other_r,
+        &matches,
+        rust_selector,
+        other_selector,
+        strict,
+    )?;
+
+    match format {
+        FormatArg::Json => println!("{}", serde_json::to_string_pretty(&analysis)?),
+        FormatArg::Table => {
+            if let Some(seed) = &analysis.rust_seed {
+                println!(
+                    "Rust seed: {} @ {}:{}",
+                    seed.name, seed.file, seed.line_start
+                );
+            } else {
+                println!("Rust seed: <unresolved>");
+            }
+            if let Some(seed) = &analysis.other_seed {
+                println!(
+                    "Other seed: {} @ {}:{}",
+                    seed.name, seed.file, seed.line_start
+                );
+            } else {
+                println!("Other seed: <unresolved>");
+            }
+
+            println!("Rust upstream set ({}):", analysis.rust_upstream.len());
+            for f in &analysis.rust_upstream {
+                println!("  - {} @ {}:{}", f.name, f.file, f.line_start);
+            }
+
+            println!("Other upstream set ({}):", analysis.other_upstream.len());
+            for f in &analysis.other_upstream {
+                println!("  - {} @ {}:{}", f.name, f.file, f.line_start);
+            }
+
+            println!("Warnings ({}):", analysis.warnings.len());
+            for w in &analysis.warnings {
+                match &w.counterpart {
+                    Some(cp) => println!(
+                        "  ! [{}] {} @ {}:{} -> {} @ {}:{}: {}",
+                        w.side,
+                        w.function.name,
+                        w.function.file,
+                        w.function.line_start,
+                        cp.name,
+                        cp.file,
+                        cp.line_start,
+                        w.message
+                    ),
+                    None => println!(
+                        "  ! [{}] {} @ {}:{}: {}",
+                        w.side, w.function.name, w.function.file, w.function.line_start, w.message
+                    ),
+                }
+            }
+
+            println!(
+                "{:<5} {:>8} {:<30} {:<30} top-contributors",
+                "ovlp", "dev", "rust", "other"
+            );
+            for row in &analysis.pairs {
+                let contribs: Vec<String> = row
+                    .per_metric
+                    .iter()
+                    .take(3)
+                    .map(|(k, rv, ov, c)| format!("{}({:.0}->{:.0} Δ={:.2})", k, ov, rv, c))
+                    .collect();
+                println!(
+                    "{:<5} {:>8.2} {:<30} {:<30} {}",
+                    if row.overlap { "yes" } else { "no" },
+                    row.total,
+                    truncate(&row.rust.name, 30),
+                    truncate(&row.other.name, 30),
+                    contribs.join(", ")
+                );
+            }
+            println!("({} translated pairs touching the upstream sets)", analysis.pairs.len());
+        }
     }
     Ok(())
 }

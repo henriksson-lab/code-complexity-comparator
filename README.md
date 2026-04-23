@@ -39,6 +39,12 @@ cargo build --release
 #    field counts bucketed by type category (int/float/pointer/string/…).
 ./target/release/ccc-rs compare-structs rust.json c.json --top 25
 ./target/release/ccc-rs missing-structs rust.json c.json
+
+# 8. Starting from a Rust and/or original-language function, walk recursive
+#    upstream caller sets on both sides, flag translation-table mismatches,
+#    and rank translated upstream pairs by complexity mismatch.
+./target/release/ccc-rs upstream rust.json c.json --rust-fn leaf_caller
+./target/release/ccc-rs upstream rust.json c.json --other-fn mm_map_frag_core
 ```
 
 `pairs_dir/` for training must contain files named `<base>.rust.json` and `<base>.c.json` (or `.cpp.json`) for each matched pair.
@@ -85,6 +91,7 @@ Language is auto-detected from file extension when `-l` is omitted. Cross-langua
 | `predict apply --model model.json --source c.json [--against rust.json]` | Predicts expected Rust metrics from C; with `--against`, also reports z-scores of actual-minus-predicted for outlier detection. |
 | `order <path>` | Emit functions in bottom-up porting order as CSV (callees before callers). `path` is a source file, source directory (use `--recurse`), or a `report.json`. Mutually recursive groups are labelled so they can be translated together. Flags: `-l`, `--recurse`, `-o file.csv`, `--strict`, `--merge prev.csv`. |
 | `order-annotate <csv> --source other.json --rust rust.json` | Append Rust counterpart columns (`rust_name`, `rust_file`, `rust_line_start`, `match_strategy`) to a CSV from `order`. Accepts `--mapping map.toml`. |
+| `upstream <rust.json> <other.json>` | Resolve a Rust seed and/or original-language seed, compute recursive upstream caller sets on both sides, flag non-overlap through the 1:1 pairing table, and list translated upstream pairs ordered by mismatch. Selectors: `--rust-fn/--rust-path/--rust-line/--rust-class` and the corresponding `--other-*` flags. If only one side is supplied, the counterpart seed is inferred from the pairing table when possible. Accepts `--mapping map.toml`, `--strict`, `--format table\|json`. |
 
 ### Bottom-up porting workflow
 
