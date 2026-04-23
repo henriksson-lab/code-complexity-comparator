@@ -1,7 +1,10 @@
 use anyhow::{anyhow, Result};
 use crate::analyzer::LanguageAnalyzer;
 use crate::core::{hash_source, Language, Param, Report, Signature, TypeRef};
-use crate::walker::{analyze_function, collect_functions, finalize_early_returns, LanguageSpec, NodeClass};
+use crate::walker::{
+    analyze_function, collect_functions, collect_structs, finalize_early_returns, LanguageSpec,
+    NodeClass,
+};
 use std::collections::BTreeMap;
 use std::path::Path;
 use tree_sitter::{Node, Parser};
@@ -39,6 +42,7 @@ impl LanguageAnalyzer for JavaAnalyzer {
             }
         }
         finalize_early_returns(&mut report.functions);
+        collect_structs(&spec, tree.root_node(), src_bytes, path, &mut report.structs);
         Ok(report)
     }
 }
@@ -183,6 +187,107 @@ impl LanguageSpec for JavaSpec {
         if let Some(th) = node.child_by_field_name("throws") {
             if let Ok(t) = th.utf8_text(src) {
                 attrs.insert("throws".into(), t.trim().to_string());
+            }
+        }
+        attrs
+    }
+
+    fn struct_kind(&self, node: &Node, _src: &[u8]) -> Option<&'static str> {
+        match node.kind() {
+            "class_declaration" => Some("class"),
+            "interface_declaration" => Some("interface"),
+            "record_declaration" => Some("record"),
+            "enum_declaration" => Some("enum"),
+            _ => None,
+        }
+    }
+
+    fn struct_name(&self, node: Node, src: &[u8]) -> Option<String> {
+        node.child_by_field_name("name")
+            .and_then(|n| n.utf8_text(src).ok())
+            .map(|s| s.to_string())
+    }
+
+    fn struct_fields(&self, node: Node, src: &[u8]) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        // `record_declaration` has its fields directly in a `parameters` node.
+        if node.kind() == "record_declaration" {
+            if let Some(params) = node.child_by_field_name("parameters") {
+                let mut cursor = params.walk();
+                for p in params.children(&mut cursor) {
+                    if p.kind() == "formal_parameter" {
+                        let ty = p
+                            .child_by_field_name("type")
+                            .and_then(|n| n.utf8_text(src).ok())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        let name = p
+                            .child_by_field_name("name")
+                            .and_then(|n| n.utf8_text(src).ok())
+                            .unwrap_or("_")
+                            .to_string();
+                        out.push((name, ty));
+                    }
+                }
+            }
+            return out;
+        }
+        let body = match node.child_by_field_name("body") {
+            Some(b) => b,
+            None => return out,
+        };
+        let mut cursor = body.walk();
+        for c in body.children(&mut cursor) {
+            if c.kind() != "field_declaration" {
+                continue;
+            }
+            let ty = c
+                .child_by_field_name("type")
+                .and_then(|n| n.utf8_text(src).ok())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            // `field_declaration` can emit one or more `variable_declarator`
+            // children (Java allows `int a, b;`).
+            let mut dcur = c.walk();
+            for cc in c.children(&mut dcur) {
+                if cc.kind() == "variable_declarator" {
+                    let name = cc
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(src).ok())
+                        .unwrap_or("_")
+                        .to_string();
+                    // Check for `[]` suffix attached to the declarator.
+                    let raw = cc.utf8_text(src).unwrap_or("");
+                    let ty_final = if raw.contains("[]") {
+                        format!("{}[]", ty)
+                    } else {
+                        ty.clone()
+                    };
+                    out.push((name, ty_final));
+                }
+            }
+        }
+        out
+    }
+
+    fn struct_attributes(&self, node: Node, src: &[u8]) -> BTreeMap<String, String> {
+        let mut attrs = BTreeMap::new();
+        if let Some(mods) = node.child_by_field_name("modifiers") {
+            let mut cursor = mods.walk();
+            for m in mods.children(&mut cursor) {
+                match m.kind() {
+                    "public" | "private" | "protected" | "static" | "final" | "abstract" => {
+                        attrs.insert(m.kind().to_string(), "true".into());
+                    }
+                    "annotation" | "marker_annotation" => {
+                        if let Ok(t) = m.utf8_text(src) {
+                            attrs.insert("annotation".into(), t.trim().to_string());
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         attrs

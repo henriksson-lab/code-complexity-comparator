@@ -26,7 +26,7 @@ pub struct Mapping {
     pub entries: Vec<MappingEntry>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct MappingEntry {
     pub rust: String,
     pub other: String,
@@ -43,6 +43,26 @@ pub struct MappingEntry {
     /// Same as `rust_path`, for the other-language side.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub other_path: Option<String>,
+    /// Optional exact `line_start` for the Rust function. Fragile (shifts
+    /// with edits), so prefer `rust_class` when you can. Still useful for
+    /// free functions that aren't inside any class/impl, or to pin by line
+    /// during bisection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rust_line: Option<u32>,
+    /// Same as `rust_line`, for the other-language side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other_line: Option<u32>,
+    /// Optional enclosing type (impl-target in Rust, class in Python/Java/
+    /// C++). Preferred over line pinning because it survives adding, moving,
+    /// or reordering functions within a file. Matches `FunctionAnalysis.
+    /// enclosing_type` exactly — e.g. `rust_class = "Cluster"` selects the
+    /// method defined in `impl Cluster { ... }` or
+    /// `impl SomeTrait for Cluster { ... }`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rust_class: Option<String>,
+    /// Same as `rust_class`, for the other-language side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other_class: Option<String>,
 }
 
 impl Mapping {
@@ -86,11 +106,15 @@ pub fn match_reports<'a>(
                 !used_rust.contains(i)
                     && f.name == e.rust
                     && path_suffix_matches(&f.location.file, e.rust_path.as_deref())
+                    && e.rust_line.is_none_or(|ln| f.location.line_start == ln)
+                    && class_matches(f.enclosing_type.as_deref(), e.rust_class.as_deref())
             });
             let oi = other.functions.iter().enumerate().find(|(i, f)| {
                 !used_other.contains(i)
                     && f.name == e.other
                     && path_suffix_matches(&f.location.file, e.other_path.as_deref())
+                    && e.other_line.is_none_or(|ln| f.location.line_start == ln)
+                    && class_matches(f.enclosing_type.as_deref(), e.other_class.as_deref())
             });
             if let (Some((ri, _)), Some((oi, _))) = (ri, oi) {
                 used_rust.insert(ri);
@@ -271,6 +295,19 @@ fn bucket_log(n: u32) -> u32 {
     }
 }
 
+/// Returns true if the function's `enclosing_type` matches `want`. When
+/// `want` is None, the constraint is satisfied vacuously. When `want` is
+/// `Some("")` we require the function have no enclosing type (free fn).
+/// Comparison is exact-string: `Cluster` matches a function recorded as
+/// `Cluster` but not `ClusterRefiner` or `Option<Cluster>`.
+pub(crate) fn class_matches(enclosing: Option<&str>, want: Option<&str>) -> bool {
+    match want {
+        None => true,
+        Some("") => enclosing.is_none(),
+        Some(w) => enclosing == Some(w),
+    }
+}
+
 /// Returns true if `file` ends with the path components of `suffix`. When
 /// `suffix` is None, the constraint is satisfied vacuously. Matching is on
 /// path components, so `format/messages/datatype.rs` matches
@@ -311,14 +348,37 @@ mod tests {
     use std::path::PathBuf;
 
     fn fa(name: &str, file: &str) -> FunctionAnalysis {
+        fa_at(name, file, 1)
+    }
+
+    fn fa_at(name: &str, file: &str, line_start: u32) -> FunctionAnalysis {
+        fa_full(name, file, line_start, None)
+    }
+
+    fn fa_in_class(
+        name: &str,
+        file: &str,
+        line_start: u32,
+        class: &str,
+    ) -> FunctionAnalysis {
+        fa_full(name, file, line_start, Some(class.to_string()))
+    }
+
+    fn fa_full(
+        name: &str,
+        file: &str,
+        line_start: u32,
+        enclosing_type: Option<String>,
+    ) -> FunctionAnalysis {
         FunctionAnalysis {
             name: name.into(),
             original_name: None,
             mangled: None,
+            enclosing_type,
             location: Location {
                 file: PathBuf::from(file),
-                line_start: 1,
-                line_end: 2,
+                line_start,
+                line_end: line_start + 1,
                 col_start: 0,
                 col_end: 0,
                 byte_start: 0,
@@ -343,6 +403,7 @@ mod tests {
             source_file: PathBuf::from("/tmp/x"),
             source_hash: "0".into(),
             functions: fns,
+            structs: Vec::new(),
         }
     }
 
@@ -387,13 +448,13 @@ mod tests {
                     rust: "decode".into(),
                     rust_path: Some("messages/datatype.rs".into()),
                     other: "H5O__dtype_decode".into(),
-                    other_path: None,
+                    ..Default::default()
                 },
                 MappingEntry {
                     rust: "decode".into(),
                     rust_path: Some("messages/link.rs".into()),
                     other: "H5O__link_decode".into(),
-                    other_path: None,
+                    ..Default::default()
                 },
             ],
         };
@@ -433,9 +494,8 @@ mod tests {
         let m = Mapping {
             entries: vec![MappingEntry {
                 rust: "decode".into(),
-                rust_path: None,
                 other: "c_decode".into(),
-                other_path: None,
+                ..Default::default()
             }],
         };
         let res = match_reports(&r, &o, Some(&m));
@@ -450,6 +510,159 @@ mod tests {
     }
 
     #[test]
+    fn mapping_disambiguates_by_line_within_single_file() {
+        // Three `new` methods in one Rust file — one impl block per class.
+        // Path suffix can't distinguish them; only line pinning can.
+        let r = rep(
+            Language::Rust,
+            vec![
+                fa_at("new", "/abs/src/model.rs", 21),   // Strand::new
+                fa_at("new", "/abs/src/model.rs", 153),  // Protein::new
+                fa_at("new", "/abs/src/model.rs", 292),  // Cluster::new
+            ],
+        );
+        let o = rep(
+            Language::Python,
+            vec![
+                fa_at("__init__", "/abs/gecco/model.py", 56),   // Strand
+                fa_at("__init__", "/abs/gecco/model.py", 412),  // Cluster
+            ],
+        );
+        let m = Mapping {
+            entries: vec![
+                MappingEntry {
+                    rust: "new".into(),
+                    rust_path: Some("src/model.rs".into()),
+                    rust_line: Some(21),
+                    other: "__init__".into(),
+                    other_path: Some("gecco/model.py".into()),
+                    other_line: Some(56),
+                    ..Default::default()
+                },
+                MappingEntry {
+                    rust: "new".into(),
+                    rust_path: Some("src/model.rs".into()),
+                    rust_line: Some(292),
+                    other: "__init__".into(),
+                    other_path: Some("gecco/model.py".into()),
+                    other_line: Some(412),
+                    ..Default::default()
+                },
+            ],
+        };
+        let res = match_reports(&r, &o, Some(&m));
+        let mapped: Vec<&Pair> = res
+            .pairs
+            .iter()
+            .filter(|p| p.strategy == MatchStrategy::Mapping)
+            .collect();
+        assert_eq!(mapped.len(), 2, "both entries should resolve");
+        // Strand pair: Rust line 21 <-> Python line 56.
+        assert!(mapped.iter().any(|p| p.rust.location.line_start == 21
+            && p.other.location.line_start == 56));
+        // Cluster pair: Rust line 292 <-> Python line 412. Protein::new at
+        // line 153 must be skipped over despite sitting between the two
+        // mapped Rust functions in source order.
+        assert!(mapped.iter().any(|p| p.rust.location.line_start == 292
+            && p.other.location.line_start == 412));
+    }
+
+    #[test]
+    fn mapping_disambiguates_by_enclosing_class() {
+        // Three `new` methods in one Rust file, each in a different impl
+        // block. Class pinning picks the right one regardless of source
+        // order — and is stable under code movement (unlike line pinning).
+        let r = rep(
+            Language::Rust,
+            vec![
+                fa_in_class("new", "/abs/src/model.rs", 21, "Strand"),
+                fa_in_class("new", "/abs/src/model.rs", 153, "Protein"),
+                fa_in_class("new", "/abs/src/model.rs", 292, "Cluster"),
+            ],
+        );
+        let o = rep(
+            Language::Python,
+            vec![
+                fa_in_class("__init__", "/abs/gecco/model.py", 56, "Strand"),
+                fa_in_class("__init__", "/abs/gecco/model.py", 412, "Cluster"),
+            ],
+        );
+        let m = Mapping {
+            entries: vec![
+                MappingEntry {
+                    rust: "new".into(),
+                    rust_class: Some("Strand".into()),
+                    other: "__init__".into(),
+                    other_class: Some("Strand".into()),
+                    ..Default::default()
+                },
+                MappingEntry {
+                    rust: "new".into(),
+                    rust_class: Some("Cluster".into()),
+                    other: "__init__".into(),
+                    other_class: Some("Cluster".into()),
+                    ..Default::default()
+                },
+            ],
+        };
+        let res = match_reports(&r, &o, Some(&m));
+        let mapped: Vec<&Pair> = res
+            .pairs
+            .iter()
+            .filter(|p| p.strategy == MatchStrategy::Mapping)
+            .collect();
+        assert_eq!(mapped.len(), 2);
+        for p in &mapped {
+            assert_eq!(
+                p.rust.enclosing_type, p.other.enclosing_type,
+                "mapped pairs should share an enclosing class"
+            );
+        }
+        // Protein::new must remain unmapped — no corresponding Python entry.
+        assert!(
+            !res.pairs
+                .iter()
+                .any(|p| p.rust.enclosing_type.as_deref() == Some("Protein")
+                    && p.strategy == MatchStrategy::Mapping),
+            "Protein::new has no Python counterpart; must not be mapped"
+        );
+    }
+
+    #[test]
+    fn class_matches_empty_string_targets_free_functions() {
+        // `rust_class = ""` constrains to enclosing_type == None (a module-
+        // level fn), not to any class literally named "".
+        assert!(class_matches(None, Some("")));
+        assert!(!class_matches(Some("Foo"), Some("")));
+        assert!(class_matches(Some("Foo"), None));
+        assert!(class_matches(Some("Foo"), Some("Foo")));
+        assert!(!class_matches(Some("Foo"), Some("Bar")));
+    }
+
+    #[test]
+    fn mapping_skips_when_line_filter_has_no_match() {
+        // No function at the requested line_start -> no Mapping pair.
+        let r = rep(Language::Rust, vec![fa_at("new", "/abs/src/model.rs", 21)]);
+        let o = rep(
+            Language::Python,
+            vec![fa_at("__init__", "/abs/gecco/model.py", 56)],
+        );
+        let m = Mapping {
+            entries: vec![MappingEntry {
+                rust: "new".into(),
+                rust_line: Some(999),
+                other: "__init__".into(),
+                ..Default::default()
+            }],
+        };
+        let res = match_reports(&r, &o, Some(&m));
+        assert!(
+            !res.pairs.iter().any(|p| p.strategy == MatchStrategy::Mapping),
+            "line filter eliminates the only candidate"
+        );
+    }
+
+    #[test]
     fn mapping_skips_when_path_filter_eliminates_all_candidates() {
         // The path filter rules out the only Rust candidate, so no Mapping
         // pair is created. Later strategies (Normalized) may still pair the
@@ -461,7 +674,7 @@ mod tests {
                 rust: "decode".into(),
                 rust_path: Some("nope/wrong.rs".into()),
                 other: "c_decode".into(),
-                other_path: None,
+                ..Default::default()
             }],
         };
         let res = match_reports(&r, &o, Some(&m));

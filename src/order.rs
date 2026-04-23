@@ -476,6 +476,7 @@ mod tests {
             name: name.into(),
             original_name: None,
             mangled: None,
+            enclosing_type: None,
             location: Location {
                 file: PathBuf::from(file),
                 line_start: line,
@@ -511,6 +512,7 @@ mod tests {
             source_file: PathBuf::from("/tmp/x"),
             source_hash: "0".into(),
             functions: fns,
+            structs: Vec::new(),
         }
     }
 

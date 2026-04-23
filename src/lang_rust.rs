@@ -1,5 +1,8 @@
 use anyhow::{anyhow, Result};
-use crate::walker::{analyze_function, collect_functions, finalize_early_returns, LanguageSpec, NodeClass};
+use crate::walker::{
+    analyze_function, collect_functions, collect_structs, finalize_early_returns, LanguageSpec,
+    NodeClass,
+};
 use crate::analyzer::LanguageAnalyzer;
 use crate::core::{hash_source, Language, Param, Report, Signature, TypeRef};
 use std::collections::BTreeMap;
@@ -39,6 +42,7 @@ impl LanguageAnalyzer for RustAnalyzer {
             }
         }
         finalize_early_returns(&mut report.functions);
+        collect_structs(&spec, tree.root_node(), src_bytes, path, &mut report.structs);
         Ok(report)
     }
 }
@@ -182,6 +186,28 @@ impl LanguageSpec for RustSpec {
         sig
     }
 
+    fn enclosing_type(&self, node: Node, src: &[u8]) -> Option<String> {
+        // Walk up until we hit an `impl_item`. The `type` field of that node
+        // is always the target type, whether the impl is inherent
+        // (`impl Cluster { ... }`) or for a trait
+        // (`impl Display for Strand { ... }` -> `Strand`). The `trait` field,
+        // if present, is the trait being implemented — intentionally ignored
+        // so that trait-method fns live under the concrete type, which is
+        // what users reach for when thinking "which class does this belong
+        // to?".
+        let mut cur = node.parent();
+        while let Some(p) = cur {
+            if p.kind() == "impl_item" {
+                return p
+                    .child_by_field_name("type")
+                    .and_then(|n| n.utf8_text(src).ok())
+                    .map(|s| s.trim().to_string());
+            }
+            cur = p.parent();
+        }
+        None
+    }
+
     fn original_name(&self, node: Node, src: &[u8]) -> Option<String> {
         // Look for preceding attribute_item siblings on the parent (mod/impl/root).
         // In tree-sitter-rust, attributes are children prior to the function_item
@@ -244,6 +270,87 @@ impl LanguageSpec for RustSpec {
                     }
                     if text.contains("cfg") && !text.contains("cfg_attr") {
                         attrs.insert("cfg".into(), text.to_string());
+                    }
+                }
+                cur = n.prev_named_sibling();
+            } else {
+                break;
+            }
+        }
+        attrs
+    }
+
+    fn struct_kind(&self, node: &Node, _src: &[u8]) -> Option<&'static str> {
+        match node.kind() {
+            "struct_item" => Some("struct"),
+            "union_item" => Some("union"),
+            _ => None,
+        }
+    }
+
+    fn struct_name(&self, node: Node, src: &[u8]) -> Option<String> {
+        node.child_by_field_name("name")
+            .and_then(|n| n.utf8_text(src).ok())
+            .map(|s| s.to_string())
+    }
+
+    fn struct_fields(&self, node: Node, src: &[u8]) -> Vec<(String, String)> {
+        // Struct body can be a `field_declaration_list` (named fields),
+        // `ordered_field_declaration_list` (tuple struct), or absent (unit
+        // struct). Union bodies always carry `field_declaration_list`.
+        let body = node.child_by_field_name("body");
+        let Some(body) = body else { return Vec::new() };
+        let mut out = Vec::new();
+        let mut cursor = body.walk();
+        for c in body.children(&mut cursor) {
+            match c.kind() {
+                "field_declaration" => {
+                    let name = c
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(src).ok())
+                        .unwrap_or("_")
+                        .to_string();
+                    let ty = c
+                        .child_by_field_name("type")
+                        .and_then(|n| n.utf8_text(src).ok())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    out.push((name, ty));
+                }
+                "ordered_field_declaration" => {
+                    // Tuple-struct positional field: no name, just a type.
+                    let ty = c
+                        .child_by_field_name("type")
+                        .and_then(|n| n.utf8_text(src).ok())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    out.push((format!("_{}", out.len()), ty));
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn struct_attributes(&self, node: Node, src: &[u8]) -> BTreeMap<String, String> {
+        let mut attrs = BTreeMap::new();
+        if let Ok(text) = node.utf8_text(src) {
+            let head = text.split('{').next().unwrap_or("");
+            if head.split_whitespace().any(|t| t == "pub") {
+                attrs.insert("pub".into(), "true".into());
+            }
+        }
+        let mut cur = node.prev_named_sibling();
+        while let Some(n) = cur {
+            if n.kind() == "attribute_item" || n.kind() == "inner_attribute_item" {
+                if let Ok(text) = n.utf8_text(src) {
+                    if text.contains("repr") {
+                        attrs.insert("repr".into(), text.trim().to_string());
+                    }
+                    if text.contains("derive") {
+                        attrs.insert("derive".into(), text.trim().to_string());
                     }
                 }
                 cur = n.prev_named_sibling();

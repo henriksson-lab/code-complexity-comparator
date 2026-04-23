@@ -8,11 +8,17 @@ pub mod matching;
 pub mod deviation;
 pub mod constants_diff;
 pub mod sort;
+pub mod structs;
 
 pub use matching::{match_reports, Mapping, MatchResult, MatchStrategy, Pair};
 pub use deviation::{deviation_rows, DeviationRow, Weights};
 pub use constants_diff::{constants_diff, ConstantsDiff, FunctionConstantsDiff};
 pub use sort::{sort_report, SortKey};
+pub use structs::{
+    category_histogram, match_structs, struct_deviation_rows, struct_metric_vector,
+    struct_missing, StructDeviationRow, StructMatchResult, StructMatchStrategy, StructMissingReport,
+    StructPair,
+};
 
 pub fn load_report(path: &Path) -> Result<Report> {
     let s = std::fs::read_to_string(path)

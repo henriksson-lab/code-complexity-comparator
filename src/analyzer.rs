@@ -8,9 +8,53 @@ pub trait LanguageAnalyzer: Send + Sync {
     fn analyze_source(&self, src: &str, path: &Path) -> Result<Report>;
 
     fn analyze_file(&self, path: &Path) -> Result<Report> {
-        let src = std::fs::read_to_string(path)
+        let bytes = std::fs::read(path)
             .map_err(|e| anyhow::anyhow!("read {}: {}", path.display(), e))?;
+        let src = decode_source_lossy_preserve_offsets(&bytes);
         self.analyze_source(&src, path)
+    }
+}
+
+fn decode_source_lossy_preserve_offsets(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(src) => src.to_owned(),
+        Err(_) => {
+            let mut out = String::with_capacity(bytes.len());
+            let mut rest = bytes;
+            while !rest.is_empty() {
+                match std::str::from_utf8(rest) {
+                    Ok(valid) => {
+                        out.push_str(valid);
+                        break;
+                    }
+                    Err(err) => {
+                        let valid_up_to = err.valid_up_to();
+                        if valid_up_to > 0 {
+                            out.push_str(std::str::from_utf8(&rest[..valid_up_to]).unwrap());
+                        }
+                        let invalid_len = err.error_len().unwrap_or(rest.len() - valid_up_to);
+                        for _ in 0..invalid_len {
+                            out.push('?');
+                        }
+                        rest = &rest[valid_up_to + invalid_len..];
+                    }
+                }
+            }
+            out
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_source_lossy_preserve_offsets;
+
+    #[test]
+    fn lossy_decode_preserves_byte_offsets_for_invalid_source() {
+        let bytes = b"abc\xff\xfed\xc3\xa9f";
+        let decoded = decode_source_lossy_preserve_offsets(bytes);
+        assert_eq!(decoded, "abc??déf");
+        assert_eq!(decoded.as_bytes().len(), bytes.len());
     }
 }
 

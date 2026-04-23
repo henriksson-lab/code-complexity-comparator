@@ -34,6 +34,11 @@ cargo build --release
 # 6. Train a linear+heuristic model and predict Rust metrics from C metrics.
 ./target/release/ccc-rs predict train pairs_dir/ --model model.json
 ./target/release/ccc-rs predict apply --model model.json --source c.json --against rust.json
+
+# 7. Compare structs/classes/records across the reports. Features are
+#    field counts bucketed by type category (int/float/pointer/string/…).
+./target/release/ccc-rs compare-structs rust.json c.json --top 25
+./target/release/ccc-rs missing-structs rust.json c.json
 ```
 
 `pairs_dir/` for training must contain files named `<base>.rust.json` and `<base>.c.json` (or `.cpp.json`) for each matched pair.
@@ -74,6 +79,8 @@ Language is auto-detected from file extension when `-l` is omitted. Cross-langua
 | `missing <rust.json> <other.json>` | Functions in C not matched to anything in Rust (plus "partial" — matched but Rust LOC is a stub-sized fraction of C). `--stub-loc-ratio 0.2` (default). |
 | `sort <report.json>` | Sort functions in one report. `--by cognitive|cyclomatic|combined-nesting|loc|halstead-difficulty|combined-nesting-x-loc|composite` (default `composite` = z-score sum). |
 | `constants-diff <rust.json> <other.json>` | Per matched pair, shows integer/float/string/char/bool constants present on only one side. Ranked by divergence score. |
+| `compare-structs <rust.json> <other.json>` | Matches structs/classes by name and ranks by deviation. Features are per-type-category field counts (int, float, bool, char, string, pointer, array, collection, other) plus total field count. Flags: `--mapping`, `--top N`, `--format table\|json`. |
+| `missing-structs <rust.json> <other.json>` | Structs present in `other` but not matched on the Rust side (and vice versa). |
 | `predict train <pairs_dir> --model model.json` | Fits one linear model per target metric via closed-form OLS over matched pairs. |
 | `predict apply --model model.json --source c.json [--against rust.json]` | Predicts expected Rust metrics from C; with `--against`, also reports z-scores of actual-minus-predicted for outlier detection. |
 | `order <path>` | Emit functions in bottom-up porting order as CSV (callees before callers). `path` is a source file, source directory (use `--recurse`), or a `report.json`. Mutually recursive groups are labelled so they can be translated together. Flags: `-l`, `--recurse`, `-o file.csv`, `--strict`, `--merge prev.csv`. |
@@ -157,6 +164,35 @@ the first unused candidate by name is paired. Path matching is on whole
 path components, so `messages/datatype.rs` matches
 `/abs/.../src/format/messages/datatype.rs` but `atype.rs` does **not**.
 
+#### Disambiguating same-named functions within one file
+
+When the same name appears several times in **one file** (e.g. three
+`new` methods across `impl` blocks in a single `model.rs`), path
+matching can't tell them apart. Prefer pinning by enclosing class:
+
+```toml
+[[entries]]
+rust        = "new"
+rust_path   = "src/model.rs"
+rust_class  = "Cluster"       # matches `impl Cluster { fn new ... }`
+other       = "__init__"
+other_path  = "gecco/model.py"
+other_class = "Cluster"       # matches Python `class Cluster: def __init__`
+```
+
+`rust_class` / `other_class` compare against `FunctionAnalysis.
+enclosing_type`, which is the impl-target in Rust (trait-impl target,
+not the trait name — `impl Display for Cluster` lands under `Cluster`),
+and the nearest `class` ancestor in Python/Java/C++. A bare name like
+`Cluster` matches exactly; use `""` to require *no* enclosing type
+(i.e. a free function / module-level fn).
+
+Class pinning survives adding/moving/reordering functions within a
+file. A line-pinning fallback is also available via `rust_line` /
+`other_line` (compared against `Location.line_start`) for cases where
+no class applies — but expect to revisit those entries when source
+shifts.
+
 ### Matching strategies
 
 Functions are matched Rust ↔ other, in priority order. The chosen strategy is recorded per pair:
@@ -181,7 +217,7 @@ Stored in `FunctionAnalysis.metrics`:
 - `halstead` — `{n1, n2, big_n1, big_n2, volume, difficulty}`.
 - `early_returns`, `goto_count`, `unsafe_blocks`.
 
-Also captured per function: `constants` (each with kind, textual form, parsed value, byte span), `calls` (callee name, count, span), `types_used`, `signature`, `attributes` (free-form language-specific bag: `static`, `inline`, `no_mangle`, `cfg`, etc.).
+Also captured per function: `enclosing_type` (impl-target in Rust, `class` in Python/Java/C++; `None` for free functions), `constants` (each with kind, textual form, parsed value, byte span), `calls` (callee name, count, span), `types_used`, `signature`, `attributes` (free-form language-specific bag: `static`, `inline`, `no_mangle`, `cfg`, etc.).
 
 ## JSON schema
 
@@ -192,9 +228,31 @@ Top level `Report`:
   "language": "c" | "cpp" | "rust" | "java" | "python" | "r" | "perl" | "fortran" | "unknown",
   "source_file": "path/to/file",
   "source_hash": "16-hex-char FNV-1a",
-  "functions": [FunctionAnalysis, ...]
+  "functions": [FunctionAnalysis, ...],
+  "structs": [StructAnalysis, ...]
 }
 ```
+
+`StructAnalysis` records one struct/class/record/union/derived_type:
+```json
+{
+  "name": "Point",
+  "kind": "struct" | "class" | "union" | "record" | "interface" | "enum" | "derived_type",
+  "location": { ... },
+  "fields": [
+    {"name": "x", "ty": {"text": "f64"}, "category": "float"},
+    {"name": "label", "ty": {"text": "String"}, "category": "string"}
+  ],
+  "metrics": {
+    "field_count": 7,
+    "int_count": 1, "float_count": 2, "bool_count": 0, "char_count": 0,
+    "string_count": 1, "pointer_count": 1, "array_count": 1,
+    "collection_count": 1, "other_count": 0
+  },
+  "attributes": { "pub": "true" }
+}
+```
+Each field's `category` is one of `int`, `float`, `bool`, `char`, `string`, `pointer`, `array`, `collection`, `other` — a language-neutral bucketing of the textual type so that a Rust `u32`, a C `uint32_t`, and a Python `int` all land in `int`. See `classify_type` in `src/core.rs`.
 
 `Constant` is tagged:
 ```json

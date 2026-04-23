@@ -1,5 +1,8 @@
 use anyhow::{anyhow, Result};
-use crate::walker::{analyze_function, collect_functions, finalize_early_returns, LanguageSpec, NodeClass};
+use crate::walker::{
+    analyze_function, collect_functions, collect_structs, finalize_early_returns, LanguageSpec,
+    NodeClass,
+};
 use crate::analyzer::LanguageAnalyzer;
 use crate::core::{hash_source, Language, Param, Report, Signature, TypeRef};
 use std::collections::BTreeMap;
@@ -53,6 +56,7 @@ impl LanguageAnalyzer for CAnalyzer {
             }
         }
         finalize_early_returns(&mut report.functions);
+        collect_structs(&spec, tree.root_node(), src_bytes, path, &mut report.structs);
         Ok(report)
     }
 }
@@ -175,6 +179,113 @@ impl LanguageSpec for CSpec {
             }
         }
         attrs
+    }
+
+    fn struct_kind(&self, node: &Node, _src: &[u8]) -> Option<&'static str> {
+        match node.kind() {
+            // tree-sitter-c wraps a top-level declaration in `declaration`,
+            // but `struct_specifier` / `union_specifier` is also the
+            // definition node when it carries a `body`. We only care about
+            // definitions (those with a body), not forward declarations.
+            "struct_specifier" if has_body(*node) => Some("struct"),
+            "union_specifier" if has_body(*node) => Some("union"),
+            // C++ `class Foo { ... };` — tree-sitter-cpp emits `class_specifier`.
+            "class_specifier" if has_body(*node) => Some("class"),
+            _ => None,
+        }
+    }
+
+    fn struct_name(&self, node: Node, src: &[u8]) -> Option<String> {
+        node.child_by_field_name("name")
+            .and_then(|n| n.utf8_text(src).ok())
+            .map(|s| s.to_string())
+    }
+
+    fn struct_fields(&self, node: Node, src: &[u8]) -> Vec<(String, String)> {
+        let body = match node.child_by_field_name("body") {
+            Some(b) => b,
+            None => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        let mut cursor = body.walk();
+        for c in body.children(&mut cursor) {
+            if c.kind() != "field_declaration" {
+                continue;
+            }
+            let ty = c
+                .child_by_field_name("type")
+                .and_then(|n| n.utf8_text(src).ok())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            // A single `field_declaration` can declare multiple fields
+            // (`int a, b, c;`). Each shows up as a separate declarator
+            // sibling on the `field_declaration` node.
+            let mut dcur = c.walk();
+            let mut emitted = false;
+            for cc in c.children(&mut dcur) {
+                if cc.kind().ends_with("declarator") || cc.kind() == "field_identifier" {
+                    if let Some(name) = extract_field_declarator_name(cc, src) {
+                        let ty_final = augment_type_from_declarator(&ty, cc, src);
+                        out.push((name, ty_final));
+                        emitted = true;
+                    }
+                }
+            }
+            if !emitted && !ty.is_empty() {
+                // Anonymous (e.g. anonymous union/struct inside). Skip —
+                // caller can still see the outer struct's field_count.
+            }
+        }
+        out
+    }
+
+    fn struct_attributes(&self, node: Node, src: &[u8]) -> BTreeMap<String, String> {
+        let mut attrs = BTreeMap::new();
+        let text = node.utf8_text(src).unwrap_or("");
+        if text.contains("__packed__") || text.contains("__attribute__((packed))") {
+            attrs.insert("packed".into(), "true".into());
+        }
+        attrs
+    }
+}
+
+fn has_body(node: Node) -> bool {
+    node.child_by_field_name("body").is_some()
+}
+
+fn extract_field_declarator_name(node: Node, src: &[u8]) -> Option<String> {
+    match node.kind() {
+        "field_identifier" | "identifier" => node.utf8_text(src).ok().map(|s| s.to_string()),
+        "pointer_declarator"
+        | "array_declarator"
+        | "function_declarator"
+        | "parenthesized_declarator"
+        | "reference_declarator" => node
+            .child_by_field_name("declarator")
+            .and_then(|d| extract_field_declarator_name(d, src)),
+        _ => {
+            let mut cur = node.walk();
+            for c in node.children(&mut cur) {
+                if let Some(n) = extract_field_declarator_name(c, src) {
+                    return Some(n);
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Re-derive the effective field type from the declarator. A declaration
+/// like `int *p;` has `type = "int"` and a `pointer_declarator`, so we
+/// prepend a `*` so the classifier buckets the field as Pointer rather than
+/// Int. Same for `int a[10]` → treat as Array.
+fn augment_type_from_declarator(base: &str, node: Node, _src: &[u8]) -> String {
+    match node.kind() {
+        "pointer_declarator" => format!("{} *", base),
+        "array_declarator" => format!("{}[]", base),
+        "reference_declarator" => format!("{} &", base),
+        _ => base.to_string(),
     }
 }
 

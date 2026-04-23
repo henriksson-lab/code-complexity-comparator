@@ -92,12 +92,26 @@ fn draw_title(f: &mut Frame, area: Rect, app: &App) {
         let rl = p
             .rust
             .as_ref()
-            .map(|f| format!("{} @ {}:{}", f.name, f.file.display(), f.line_start))
+            .map(|f| {
+                format!(
+                    "{} @ {}:{}",
+                    qualified_name(&f.enclosing_type, &f.name),
+                    f.file.display(),
+                    f.line_start
+                )
+            })
             .unwrap_or_else(|| format!("{} [missing]", p.rust_target));
         let ol = p
             .other
             .as_ref()
-            .map(|f| format!("{} @ {}:{}", f.name, f.file.display(), f.line_start))
+            .map(|f| {
+                format!(
+                    "{} @ {}:{}",
+                    qualified_name(&f.enclosing_type, &f.name),
+                    f.file.display(),
+                    f.line_start
+                )
+            })
             .unwrap_or_else(|| format!("{} [missing]", p.other_target));
         format!("pair {}/{}   rust: {}    other: {}", app.idx + 1, app.pairs.len(), rl, ol)
     } else {
@@ -105,6 +119,17 @@ fn draw_title(f: &mut Frame, area: Rect, app: &App) {
     };
     let p = Paragraph::new(title).style(Style::default().add_modifier(Modifier::BOLD));
     f.render_widget(p, area);
+}
+
+/// Render `Class::method` when the function lives inside a class/impl, else
+/// the bare name. Mirrors how both Rust (`Cluster::new`) and Python
+/// (`Cluster.__init__`, displayed here as `Cluster::__init__` for uniformity)
+/// users typically refer to methods.
+fn qualified_name(enclosing: &Option<String>, name: &str) -> String {
+    match enclosing {
+        Some(cls) => format!("{cls}::{name}"),
+        None => name.to_string(),
+    }
 }
 
 fn draw_pane(
@@ -121,7 +146,7 @@ fn draw_pane(
         Some(lf) => format!(
             "{} — {} ({}:{}-{})",
             side_label,
-            lf.name,
+            qualified_name(&lf.enclosing_type, &lf.name),
             file_tail(&lf.file.display().to_string()),
             lf.line_start,
             lf.line_end
@@ -201,7 +226,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         HighlightMode::IdentityShared => "Identity-Shared",
     };
     let s = format!(
-        "mode: {}   ↑↓ pair   ←→ scroll   PgUp/PgDn ±10   C toggle mode   Q quit",
+        "mode: {}   ←→ pair   ↑↓ scroll   PgUp/PgDn ±10   C toggle mode   Q quit",
         mode
     );
     let p = Paragraph::new(s).style(Style::default().fg(Color::DarkGray));

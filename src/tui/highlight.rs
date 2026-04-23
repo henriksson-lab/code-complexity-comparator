@@ -43,6 +43,31 @@ pub struct Token {
 }
 
 pub fn tokenize_function(lang: Language, source: &str, fa: &FunctionAnalysis) -> Vec<Token> {
+    let byte_start = fa.location.byte_start as usize;
+    let byte_end = (fa.location.byte_end as usize).min(source.len());
+    let origin_row = fa.location.line_start.saturating_sub(1);
+    let origin_col = fa.location.col_start;
+    tokenize_range(lang, source, byte_start, byte_end, origin_row, origin_col)
+}
+
+/// Tokenize an arbitrary byte range, emitting token positions relative to
+/// a caller-supplied origin. The TUI uses this so it can prepend leading
+/// comment / attribute lines to the displayed slice and still keep token
+/// line/column offsets aligned with what ends up on screen.
+///
+/// - `byte_start`/`byte_end` — range within `source` to tokenize.
+/// - `origin_row` — 0-based row that the caller treats as line 0 of the
+///   displayed slice. Usually the row of `byte_start` itself.
+/// - `origin_col` — column on `origin_row` that corresponds to column 0 of
+///   the displayed first line.
+pub fn tokenize_range(
+    lang: Language,
+    source: &str,
+    byte_start: usize,
+    byte_end: usize,
+    origin_row: u32,
+    origin_col: u32,
+) -> Vec<Token> {
     let Some(ts_lang) = ts_language(lang) else {
         return Vec::new();
     };
@@ -54,11 +79,7 @@ pub fn tokenize_function(lang: Language, source: &str, fa: &FunctionAnalysis) ->
         return Vec::new();
     };
 
-    let fn_start_row = fa.location.line_start.saturating_sub(1);
-    let fn_start_col = fa.location.col_start;
-    let byte_start = fa.location.byte_start as usize;
-    let byte_end = (fa.location.byte_end as usize).min(source.len());
-
+    let byte_end = byte_end.min(source.len());
     let mut tokens = Vec::new();
     let mut cursor = tree.walk();
     visit(
@@ -67,8 +88,8 @@ pub fn tokenize_function(lang: Language, source: &str, fa: &FunctionAnalysis) ->
         lang,
         byte_start,
         byte_end,
-        fn_start_row,
-        fn_start_col,
+        origin_row,
+        origin_col,
         &mut tokens,
     );
     tokens
@@ -90,6 +111,17 @@ fn visit(
     if e <= byte_start || s >= byte_end {
         return;
     }
+    // Some tree-sitter grammars model comments and strings as composite
+    // nodes with children: tree-sitter-rust splits `///` into an `outer
+    // doc comment marker` + content; string literals expose quote children
+    // and escape sequences. Recursing into them would emit each piece
+    // separately and the prefix (`//`, `"`) would land in the operator /
+    // punctuation buckets, not in the comment/string bucket. Treat these
+    // as atomic from the renderer's point of view.
+    if is_atomic_token_kind(node.kind()) {
+        emit_leaf(node, src, lang, fn_start_row, fn_start_col, out);
+        return;
+    }
     if node.child_count() == 0 {
         emit_leaf(node, src, lang, fn_start_row, fn_start_col, out);
         return;
@@ -103,6 +135,14 @@ fn visit(
         }
         cursor.goto_parent();
     }
+}
+
+fn is_atomic_token_kind(kind: &str) -> bool {
+    // Anything that should colorize as one run regardless of internal
+    // structure. `contains` covers language variants (line_comment,
+    // block_comment, doc_comment, string_literal, raw_string_literal,
+    // byte_string_literal, char_literal, etc.).
+    kind.contains("comment") || kind.contains("string") || kind == "char_literal"
 }
 
 fn emit_leaf(

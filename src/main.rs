@@ -2,8 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use code_complexity_comparator_rs::analyzer::{LanguageAnalyzer, Registry};
 use code_complexity_comparator_rs::compare::{
-    constants_diff, deviation_rows, load_report, match_reports, missing, sort_report, Mapping,
-    SortKey, Weights,
+    constants_diff, deviation_rows, load_report, match_reports, match_structs, missing,
+    sort_report, struct_deviation_rows, struct_missing, Mapping, SortKey, Weights,
 };
 use code_complexity_comparator_rs::core::{Language, Report};
 use code_complexity_comparator_rs::lang_c::CAnalyzer;
@@ -80,6 +80,28 @@ enum Cmd {
         mapping: Option<PathBuf>,
         #[arg(long, default_value_t = 20)]
         top: usize,
+        #[arg(long, default_value = "table")]
+        format: FormatArg,
+    },
+    /// Compare structs (struct / class / record / derived_type) across two
+    /// reports. Matches by name; ranks by a deviation score built from
+    /// per-type-category field counts (int/float/pointer/string/…).
+    CompareStructs {
+        rust: PathBuf,
+        other: PathBuf,
+        #[arg(long)]
+        mapping: Option<PathBuf>,
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+        #[arg(long, default_value = "table")]
+        format: FormatArg,
+    },
+    /// Report structs present in `other` but not in `rust` (and vice versa).
+    MissingStructs {
+        rust: PathBuf,
+        other: PathBuf,
+        #[arg(long)]
+        mapping: Option<PathBuf>,
         #[arg(long, default_value = "table")]
         format: FormatArg,
     },
@@ -247,6 +269,14 @@ fn main() -> Result<()> {
             let mapping = resolve_mapping(mapping);
             cmd_constants_diff(&rust, &other, mapping.as_deref(), top, format)
         }
+        Cmd::CompareStructs { rust, other, mapping, top, format } => {
+            let mapping = resolve_mapping(mapping);
+            cmd_compare_structs(&rust, &other, mapping.as_deref(), top, format)
+        }
+        Cmd::MissingStructs { rust, other, mapping, format } => {
+            let mapping = resolve_mapping(mapping);
+            cmd_missing_structs(&rust, &other, mapping.as_deref(), format)
+        }
         Cmd::Order { path, lang, recurse, out, strict, merge } => {
             cmd_order(&path, lang, recurse, out.as_deref(), strict, merge.as_deref())
         }
@@ -312,9 +342,11 @@ fn cmd_analyze(path: &Path, lang: Option<LangArg>, out: Option<&Path>, recurse: 
             source_file: path.to_path_buf(),
             source_hash: String::new(),
             functions: Vec::new(),
+            structs: Vec::new(),
         };
         for sub in reports {
             r.functions.extend(sub.functions);
+            r.structs.extend(sub.structs);
         }
         r
     };
@@ -542,6 +574,83 @@ fn cmd_constants_diff(
     Ok(())
 }
 
+fn cmd_compare_structs(
+    rust: &Path,
+    other: &Path,
+    mapping: Option<&Path>,
+    top: usize,
+    format: FormatArg,
+) -> Result<()> {
+    let rust_r = load_report(rust)?;
+    let other_r = load_report(other)?;
+    let map = mapping.map(Mapping::load).transpose()?;
+    let m = match_structs(&rust_r, &other_r, map.as_ref());
+    let rows = struct_deviation_rows(&rust_r, &other_r, &m);
+
+    let shown: Vec<_> = rows.iter().take(top).collect();
+    match format {
+        FormatArg::Json => {
+            println!("{}", serde_json::to_string_pretty(&shown)?);
+        }
+        FormatArg::Table => {
+            println!(
+                "{:<30} {:<30} {:>8} top-contributors",
+                "rust", "other", "deviation"
+            );
+            for r in shown {
+                let contribs: Vec<String> = r
+                    .per_category
+                    .iter()
+                    .take(3)
+                    .filter(|(_, _, _, c)| *c > 0.0)
+                    .map(|(k, rv, ov, c)| format!("{}({:.0}->{:.0} Δ={:.2})", k, ov, rv, c))
+                    .collect();
+                println!(
+                    "{:<30} {:<30} {:>8.2}  {}",
+                    truncate(&r.rust_name, 30),
+                    truncate(&r.other_name, 30),
+                    r.total,
+                    contribs.join(", ")
+                );
+            }
+            println!(
+                "({} matched struct pairs, {} rust / {} other structs total)",
+                rows.len(),
+                rust_r.structs.len(),
+                other_r.structs.len(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_missing_structs(
+    rust: &Path,
+    other: &Path,
+    mapping: Option<&Path>,
+    format: FormatArg,
+) -> Result<()> {
+    let rust_r = load_report(rust)?;
+    let other_r = load_report(other)?;
+    let map = mapping.map(Mapping::load).transpose()?;
+    let m = match_structs(&rust_r, &other_r, map.as_ref());
+    let rep = struct_missing(&rust_r, &other_r, &m);
+    match format {
+        FormatArg::Json => println!("{}", serde_json::to_string_pretty(&rep)?),
+        FormatArg::Table => {
+            println!("Missing in Rust ({}):", rep.missing_in_rust.len());
+            for n in &rep.missing_in_rust {
+                println!("  - {}", n);
+            }
+            println!("Extra in Rust ({}):", rep.extra_in_rust.len());
+            for n in &rep.extra_in_rust {
+                println!("  + {}", n);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn cmd_predict_train(pairs_dir: &Path, model_path: &Path) -> Result<()> {
     let mut pairs: Vec<(Report, Report)> = Vec::new();
     let mut by_base: std::collections::BTreeMap<String, (Option<PathBuf>, Option<PathBuf>)> = Default::default();
@@ -638,9 +747,11 @@ fn cmd_order(
             source_file: path.to_path_buf(),
             source_hash: String::new(),
             functions: Vec::new(),
+            structs: Vec::new(),
         };
         for sub in reports {
             merged.functions.extend(sub.functions);
+            merged.structs.extend(sub.structs);
         }
         merged
     };

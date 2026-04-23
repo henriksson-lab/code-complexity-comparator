@@ -1,7 +1,10 @@
 use anyhow::{anyhow, Result};
 use crate::analyzer::LanguageAnalyzer;
 use crate::core::{hash_source, Language, Param, Report, Signature, TypeRef};
-use crate::walker::{analyze_function, collect_functions, finalize_early_returns, LanguageSpec, NodeClass};
+use crate::walker::{
+    analyze_function, collect_functions, collect_structs, finalize_early_returns, LanguageSpec,
+    NodeClass,
+};
 use std::collections::BTreeMap;
 use std::path::Path;
 use tree_sitter::{Node, Parser};
@@ -39,6 +42,7 @@ impl LanguageAnalyzer for FortranAnalyzer {
             }
         }
         finalize_early_returns(&mut report.functions);
+        collect_structs(&spec, tree.root_node(), src_bytes, path, &mut report.structs);
         Ok(report)
     }
 }
@@ -204,5 +208,75 @@ impl LanguageSpec for FortranSpec {
             attrs.insert("kind".into(), "subroutine".into());
         }
         attrs
+    }
+
+    fn struct_kind(&self, node: &Node, _src: &[u8]) -> Option<&'static str> {
+        if node.kind() == "derived_type_definition" {
+            Some("derived_type")
+        } else {
+            None
+        }
+    }
+
+    fn struct_name(&self, node: Node, src: &[u8]) -> Option<String> {
+        let mut cur = node.walk();
+        for c in node.children(&mut cur) {
+            if c.kind() == "derived_type_statement" {
+                if let Some(n) = c.child_by_field_name("name") {
+                    return n.utf8_text(src).ok().map(|s| s.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    fn struct_fields(&self, node: Node, src: &[u8]) -> Vec<(String, String)> {
+        // A derived type body carries `variable_declaration` children; each
+        // has a `type` field and one or more identifiers (or a `declarator`
+        // wrapping a name).
+        let mut out = Vec::new();
+        let mut cur = node.walk();
+        for c in node.children(&mut cur) {
+            if c.kind() != "variable_declaration" {
+                continue;
+            }
+            let ty = c
+                .child_by_field_name("type")
+                .and_then(|n| n.utf8_text(src).ok())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let mut dcur = c.walk();
+            let mut emitted = false;
+            for cc in c.children(&mut dcur) {
+                match cc.kind() {
+                    "identifier" | "name" => {
+                        if let Ok(t) = cc.utf8_text(src) {
+                            out.push((t.to_string(), ty.clone()));
+                            emitted = true;
+                        }
+                    }
+                    "init_declarator" | "call_expression" => {
+                        // `real :: a(10)` parses the name as part of a
+                        // call_expression; treat the callee as the field
+                        // name and mark as an array type.
+                        if let Some(f) = cc.child_by_field_name("function") {
+                            if let Ok(t) = f.utf8_text(src) {
+                                out.push((t.to_string(), format!("{}, dimension(..)", ty)));
+                                emitted = true;
+                            }
+                        } else if let Some(d) = cc.child_by_field_name("declarator") {
+                            if let Ok(t) = d.utf8_text(src) {
+                                out.push((t.to_string(), ty.clone()));
+                                emitted = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let _ = emitted;
+        }
+        out
     }
 }

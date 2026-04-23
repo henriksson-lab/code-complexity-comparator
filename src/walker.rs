@@ -2,7 +2,10 @@
 //! classify tree-sitter nodes; the walker handles nesting, accumulation and
 //! final metric computation uniformly across languages.
 
-use crate::core::{Call, Constant, FunctionAnalysis, Halstead, Location, Metrics, Signature, TypeRef};
+use crate::core::{
+    classify_type, Call, Constant, FunctionAnalysis, Halstead, Location, Metrics, Signature,
+    StructAnalysis, StructField, StructMetrics, TypeRef,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use tree_sitter::Node;
@@ -91,6 +94,14 @@ pub trait LanguageSpec: Send + Sync {
         None
     }
 
+    /// Extract the enclosing class / impl-target / struct name for the
+    /// function, if any. Walk the parent chain and return the nearest class-
+    /// like container. Default `None` covers C, Fortran, and similar
+    /// languages that don't model methods this way.
+    fn enclosing_type(&self, _node: Node, _src: &[u8]) -> Option<String> {
+        None
+    }
+
     /// Additional per-language attributes to stash on the function record.
     fn attributes(&self, _node: Node, _src: &[u8]) -> BTreeMap<String, String> {
         BTreeMap::new()
@@ -101,6 +112,31 @@ pub trait LanguageSpec: Send + Sync {
     /// overridden.
     fn operator_text(&self, node: Node, src: &[u8]) -> Option<String> {
         node.utf8_text(src).ok().map(|s| s.to_string())
+    }
+
+    /// Returns `Some(kind)` if the node is a struct-like declaration to be
+    /// recorded on the report (`"struct"`, `"class"`, `"union"`, `"record"`,
+    /// `"derived_type"`). Default `None` suppresses struct extraction for
+    /// languages that don't carry structs at the source level (Perl, R).
+    fn struct_kind(&self, _node: &Node, _src: &[u8]) -> Option<&'static str> {
+        None
+    }
+
+    /// Extract the declared name from a struct-like node.
+    fn struct_name(&self, _node: Node, _src: &[u8]) -> Option<String> {
+        None
+    }
+
+    /// Extract the (name, type) pairs for each field declared directly on
+    /// the struct-like node. Type text is stored verbatim; classification
+    /// happens in the walker.
+    fn struct_fields(&self, _node: Node, _src: &[u8]) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    /// Per-struct attribute bag (e.g. `repr`, `packed`, `visibility`).
+    fn struct_attributes(&self, _node: Node, _src: &[u8]) -> BTreeMap<String, String> {
+        BTreeMap::new()
     }
 }
 
@@ -262,6 +298,7 @@ pub fn analyze_function<S: LanguageSpec>(
     let name = spec.function_name(node, src)?;
     let signature = spec.signature(node, src);
     let original_name = spec.original_name(node, src);
+    let enclosing_type = spec.enclosing_type(node, src);
     let attributes = spec.attributes(node, src);
 
     let mut acc = Acc::new(node);
@@ -338,6 +375,7 @@ pub fn analyze_function<S: LanguageSpec>(
         name,
         original_name,
         mangled: None,
+        enclosing_type,
         location: Location {
             file: path.to_path_buf(),
             line_start: sr + 1,
@@ -620,6 +658,82 @@ pub fn collect_functions<'a, S: LanguageSpec>(
     for child in root.children(&mut cursor) {
         collect_functions(spec, child, src, out);
     }
+}
+
+/// Walk the AST top-down and collect every struct-like node that the spec
+/// reports as such, producing a `StructAnalysis` per node. Matching uses
+/// `LanguageSpec::struct_kind` so a language can choose which grammar nodes
+/// count (e.g. `struct_item`, `class_declaration`, `derived_type_definition`).
+pub fn collect_structs<S: LanguageSpec>(
+    spec: &S,
+    root: Node,
+    src: &[u8],
+    path: &Path,
+    out: &mut Vec<StructAnalysis>,
+) {
+    walk_structs(spec, root, src, path, out);
+}
+
+fn walk_structs<S: LanguageSpec>(
+    spec: &S,
+    node: Node,
+    src: &[u8],
+    path: &Path,
+    out: &mut Vec<StructAnalysis>,
+) {
+    if let Some(kind) = spec.struct_kind(&node, src) {
+        if let Some(sa) = analyze_struct(spec, node, src, path, kind) {
+            out.push(sa);
+        }
+        // Recurse: nested structs inside classes (Java inner classes, Rust
+        // nested structs) should still be picked up.
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_structs(spec, child, src, path, out);
+    }
+}
+
+fn analyze_struct<S: LanguageSpec>(
+    spec: &S,
+    node: Node,
+    src: &[u8],
+    path: &Path,
+    kind: &'static str,
+) -> Option<StructAnalysis> {
+    let name = spec.struct_name(node, src)?;
+    let raw_fields = spec.struct_fields(node, src);
+    let fields: Vec<StructField> = raw_fields
+        .into_iter()
+        .map(|(name, ty)| {
+            let category = classify_type(&ty);
+            StructField {
+                name,
+                ty: TypeRef::new(ty),
+                category,
+            }
+        })
+        .collect();
+    let metrics = StructMetrics::from_fields(&fields);
+    let attributes = spec.struct_attributes(node, src);
+    let sr = node.start_position().row as u32;
+    let er = node.end_position().row as u32;
+    Some(StructAnalysis {
+        name,
+        kind: kind.to_string(),
+        location: Location {
+            file: path.to_path_buf(),
+            line_start: sr + 1,
+            line_end: er + 1,
+            col_start: node.start_position().column as u32,
+            col_end: node.end_position().column as u32,
+            byte_start: node.start_byte() as u32,
+            byte_end: node.end_byte() as u32,
+        },
+        fields,
+        metrics,
+        attributes,
+    })
 }
 
 #[cfg(test)]
