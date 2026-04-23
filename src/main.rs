@@ -203,6 +203,8 @@ enum Cmd {
         /// same-named candidate as a caller/callee.
         #[arg(long)]
         strict: bool,
+        #[arg(long, default_value_t = 20)]
+        top: usize,
         #[arg(long, default_value = "table")]
         format: FormatArg,
     },
@@ -400,9 +402,9 @@ fn main() -> Result<()> {
                 format,
             )
         }
-        Cmd::CallGraphDiff { rust, other, mapping, strict, format } => {
+        Cmd::CallGraphDiff { rust, other, mapping, strict, top, format } => {
             let mapping = resolve_mapping(mapping);
-            cmd_call_graph_diff(&rust, &other, mapping.as_deref(), strict, format)
+            cmd_call_graph_diff(&rust, &other, mapping.as_deref(), strict, top, format)
         }
     }
 }
@@ -993,13 +995,17 @@ fn cmd_call_graph_diff(
     other: &Path,
     mapping: Option<&Path>,
     strict: bool,
+    top: usize,
     format: FormatArg,
 ) -> Result<()> {
     let rust_r = load_report(rust)?;
     let other_r = load_report(other)?;
     let map = mapping.map(Mapping::load).transpose()?;
     let matches = match_reports(&rust_r, &other_r, map.as_ref());
-    let analysis = analyze_call_graph_diff(&rust_r, &other_r, &matches, strict);
+    let mut analysis = analyze_call_graph_diff(&rust_r, &other_r, &matches, strict);
+    analysis.edges_only_in_rust.truncate(top);
+    analysis.edges_only_in_other.truncate(top);
+    analysis.pairs.truncate(top);
 
     match format {
         FormatArg::Json => println!("{}", serde_json::to_string_pretty(&analysis)?),
@@ -1029,7 +1035,7 @@ fn cmd_call_graph_diff(
             );
 
             if !analysis.edges_only_in_rust.is_empty() {
-                println!("Edges only in rust ({}):", analysis.edges_only_in_rust.len());
+                println!("Edges only in rust (showing {}):", analysis.edges_only_in_rust.len());
                 for edge in &analysis.edges_only_in_rust {
                     println!(
                         "  - {} @ {}:{} -> {} @ {}:{}",
@@ -1043,7 +1049,7 @@ fn cmd_call_graph_diff(
                 }
             }
             if !analysis.edges_only_in_other.is_empty() {
-                println!("Edges only in other ({}):", analysis.edges_only_in_other.len());
+                println!("Edges only in other (showing {}):", analysis.edges_only_in_other.len());
                 for edge in &analysis.edges_only_in_other {
                     println!(
                         "  - {} @ {}:{} -> {} @ {}:{}",
@@ -1057,6 +1063,10 @@ fn cmd_call_graph_diff(
                 }
             }
 
+            println!(
+                "Top structural mismatches (showing {}):",
+                analysis.pairs.len()
+            );
             println!(
                 "{:<5} {:>6} {:>5} {:>5} {:<30} {:<30}",
                 "ovlp", "total", "rcal", "ocal", "rust", "other"
