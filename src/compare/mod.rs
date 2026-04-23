@@ -10,6 +10,7 @@ pub mod constants_diff;
 pub mod sort;
 pub mod structs;
 pub mod upstream;
+pub mod call_graph;
 
 pub use matching::{match_reports, Mapping, MatchResult, MatchStrategy, Pair};
 pub use deviation::{deviation_rows, DeviationRow, Weights};
@@ -23,6 +24,10 @@ pub use structs::{
 pub use upstream::{
     analyze_upstream, FunctionRef, FunctionSelector, UpstreamAnalysis, UpstreamPairRow,
     UpstreamWarning,
+};
+pub use call_graph::{
+    analyze_call_graph_diff, CallGraphDiffAnalysis, CallGraphDiffSummary, CallGraphPairDiffRow,
+    GraphEdgeRef,
 };
 
 pub fn load_report(path: &Path) -> Result<Report> {

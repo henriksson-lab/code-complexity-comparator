@@ -2,9 +2,9 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use code_complexity_comparator_rs::analyzer::{LanguageAnalyzer, Registry};
 use code_complexity_comparator_rs::compare::{
-    analyze_upstream, constants_diff, deviation_rows, load_report, match_reports, match_structs,
-    missing, sort_report, struct_deviation_rows, struct_missing, FunctionSelector, Mapping,
-    SortKey, Weights,
+    analyze_call_graph_diff, analyze_upstream, constants_diff, deviation_rows, load_report,
+    match_reports, match_structs, missing, sort_report, struct_deviation_rows, struct_missing,
+    FunctionSelector, Mapping, SortKey, Weights,
 };
 use code_complexity_comparator_rs::core::{Language, Report};
 use code_complexity_comparator_rs::lang_c::CAnalyzer;
@@ -186,6 +186,19 @@ enum Cmd {
         other_line: Option<u32>,
         #[arg(long = "other-class")]
         other_class: Option<String>,
+        /// Drop ambiguous call edges instead of conservatively treating every
+        /// same-named candidate as a caller/callee.
+        #[arg(long)]
+        strict: bool,
+        #[arg(long, default_value = "table")]
+        format: FormatArg,
+    },
+    /// Compare translated caller/callee graph structure across matched pairs.
+    CallGraphDiff {
+        rust: PathBuf,
+        other: PathBuf,
+        #[arg(long)]
+        mapping: Option<PathBuf>,
         /// Drop ambiguous call edges instead of conservatively treating every
         /// same-named candidate as a caller/callee.
         #[arg(long)]
@@ -386,6 +399,10 @@ fn main() -> Result<()> {
                 strict,
                 format,
             )
+        }
+        Cmd::CallGraphDiff { rust, other, mapping, strict, format } => {
+            let mapping = resolve_mapping(mapping);
+            cmd_call_graph_diff(&rust, &other, mapping.as_deref(), strict, format)
         }
     }
 }
@@ -966,6 +983,95 @@ fn cmd_upstream(
                 );
             }
             println!("({} translated pairs touching the upstream sets)", analysis.pairs.len());
+        }
+    }
+    Ok(())
+}
+
+fn cmd_call_graph_diff(
+    rust: &Path,
+    other: &Path,
+    mapping: Option<&Path>,
+    strict: bool,
+    format: FormatArg,
+) -> Result<()> {
+    let rust_r = load_report(rust)?;
+    let other_r = load_report(other)?;
+    let map = mapping.map(Mapping::load).transpose()?;
+    let matches = match_reports(&rust_r, &other_r, map.as_ref());
+    let analysis = analyze_call_graph_diff(&rust_r, &other_r, &matches, strict);
+
+    match format {
+        FormatArg::Json => println!("{}", serde_json::to_string_pretty(&analysis)?),
+        FormatArg::Table => {
+            println!("Matched pairs: {}", analysis.summary.matched_pairs);
+            println!(
+                "Translated edges: rust={} other={}",
+                analysis.summary.translated_edges_in_rust,
+                analysis.summary.translated_edges_in_other
+            );
+            println!(
+                "Edge differences: only-in-rust={} only-in-other={}",
+                analysis.summary.edges_only_in_rust,
+                analysis.summary.edges_only_in_other
+            );
+            println!(
+                "Recursion mismatches: kind={} scc-size={}",
+                analysis.summary.recursive_kind_mismatches,
+                analysis.summary.scc_size_mismatches
+            );
+            println!(
+                "Ambiguous/unresolved call sites: rust={}/{} other={}/{}",
+                analysis.summary.rust_ambiguous_call_sites,
+                analysis.summary.rust_unresolved_call_sites,
+                analysis.summary.other_ambiguous_call_sites,
+                analysis.summary.other_unresolved_call_sites
+            );
+
+            if !analysis.edges_only_in_rust.is_empty() {
+                println!("Edges only in rust ({}):", analysis.edges_only_in_rust.len());
+                for edge in &analysis.edges_only_in_rust {
+                    println!(
+                        "  - {} @ {}:{} -> {} @ {}:{}",
+                        edge.src.name,
+                        edge.src.file,
+                        edge.src.line_start,
+                        edge.dst.name,
+                        edge.dst.file,
+                        edge.dst.line_start
+                    );
+                }
+            }
+            if !analysis.edges_only_in_other.is_empty() {
+                println!("Edges only in other ({}):", analysis.edges_only_in_other.len());
+                for edge in &analysis.edges_only_in_other {
+                    println!(
+                        "  - {} @ {}:{} -> {} @ {}:{}",
+                        edge.src.name,
+                        edge.src.file,
+                        edge.src.line_start,
+                        edge.dst.name,
+                        edge.dst.file,
+                        edge.dst.line_start
+                    );
+                }
+            }
+
+            println!(
+                "{:<5} {:>6} {:>5} {:>5} {:<30} {:<30}",
+                "ovlp", "total", "rcal", "ocal", "rust", "other"
+            );
+            for row in &analysis.pairs {
+                println!(
+                    "{:<5} {:>6.1} {:>5} {:>5} {:<30} {:<30}",
+                    if row.total == 0.0 { "yes" } else { "no" },
+                    row.total,
+                    row.rust_callees + row.rust_callers,
+                    row.other_callees + row.other_callers,
+                    truncate(&row.rust.name, 30),
+                    truncate(&row.other.name, 30)
+                );
+            }
         }
     }
     Ok(())
