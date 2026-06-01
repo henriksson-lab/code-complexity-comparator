@@ -1,10 +1,10 @@
-use anyhow::{anyhow, Result};
 use crate::analyzer::LanguageAnalyzer;
 use crate::core::{hash_source, Language, Param, Report, Signature, TypeRef};
 use crate::walker::{
     analyze_function, collect_functions, collect_structs, finalize_early_returns, LanguageSpec,
     NodeClass,
 };
+use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
 use std::path::Path;
 use tree_sitter::{Node, Parser};
@@ -12,24 +12,34 @@ use tree_sitter::{Node, Parser};
 pub struct PythonAnalyzer;
 
 impl PythonAnalyzer {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl Default for PythonAnalyzer {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LanguageAnalyzer for PythonAnalyzer {
-    fn language(&self) -> Language { Language::Python }
+    fn language(&self) -> Language {
+        Language::Python
+    }
 
-    fn extensions(&self) -> &[&'static str] { &["py"] }
+    fn extensions(&self) -> &[&'static str] {
+        &["py"]
+    }
 
     fn analyze_source(&self, src: &str, path: &Path) -> Result<Report> {
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_python::LANGUAGE.into())
             .map_err(|e| anyhow!("set language python: {}", e))?;
-        let tree = parser.parse(src, None).ok_or_else(|| anyhow!("parse failed"))?;
+        let tree = parser
+            .parse(src, None)
+            .ok_or_else(|| anyhow!("parse failed"))?;
         let src_bytes = src.as_bytes();
         let mut report = Report::new(Language::Python, path.to_path_buf(), hash_source(src));
 
@@ -42,7 +52,13 @@ impl LanguageAnalyzer for PythonAnalyzer {
             }
         }
         finalize_early_returns(&mut report.functions);
-        collect_structs(&spec, tree.root_node(), src_bytes, path, &mut report.structs);
+        collect_structs(
+            &spec,
+            tree.root_node(),
+            src_bytes,
+            path,
+            &mut report.structs,
+        );
         Ok(report)
     }
 }
@@ -72,8 +88,12 @@ impl LanguageSpec for PythonSpec {
             "false" => NodeClass::BoolLit(false),
             "identifier" => NodeClass::Identifier,
             "boolean_operator" => NodeClass::ShortCircuit,
-            "binary_operator" | "unary_operator" | "comparison_operator"
-            | "assignment" | "augmented_assignment" | "not_operator" => NodeClass::Operator,
+            "binary_operator"
+            | "unary_operator"
+            | "comparison_operator"
+            | "assignment"
+            | "augmented_assignment"
+            | "not_operator" => NodeClass::Operator,
             "block" => NodeClass::Block,
             _ => NodeClass::None,
         }

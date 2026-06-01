@@ -71,7 +71,7 @@ Language is auto-detected from file extension when `-l` is omitted. Cross-langua
 
 ### Per-language notes
 
-- **Rust**: `#[no_mangle]` / `#[link_name = "..."]` extracted into `original_name` so FFI bindings match the foreign symbol automatically.
+- **Rust**: `#[no_mangle]` / `#[link_name = "..."]` extracted into `original_name` so FFI bindings match the foreign symbol automatically. Rust doc comments using `Matches C++ \`Qualified::name(args)\`` are also extracted into `original_name` for faithful ports that keep idiomatic Rust names.
 - **C/C++**: treats both `goto` and `gnu_asm_expression` as signals; `asm!` / inline asm lines counted separately as `loc_asm`.
 - **Java**: method polymorphism (same method name across many classes) produces many same-name matches; use a mapping file to disambiguate.
 - **Python**: `elif_clause` counted flat, not nested. `yield` / `raise_statement` both count as early returns.
@@ -211,10 +211,11 @@ shifts.
 Functions are matched Rust ↔ other, in priority order. The chosen strategy is recorded per pair:
 
 1. **Mapping** — explicit entry in the mapping file.
-2. **FfiAttribute** — Rust `#[no_mangle]` or `#[link_name = "…"]` equals the other-language function name. Extracted into the Rust report's `original_name` field.
-3. **ExactName** — identical names.
-4. **Normalized** — snake/camelCase folded, trivial suffixes like `_impl`, `_inner`, `_rs`, `_c` stripped.
-5. **Fingerprint** — same `(arity, return_count, log2(loc))` *and* a shared token of ≥ 4 chars. Deliberately conservative; spurious matches from short names were the #1 noise source.
+2. **FfiAttribute** — Rust `#[no_mangle]`, `#[link_name = "…"]`, or `Matches C++ \`...\`` doc comments equal the other-language function name. Extracted into the Rust report's `original_name` field.
+3. **QualifiedMethod** — C++ `Type::method` matches Rust `impl Type { fn method(...) }`; constructors match `new`/`default`, destructors match `drop` when present.
+4. **ExactName** — identical names.
+5. **Normalized** — snake/camelCase folded, trivial suffixes like `_impl`, `_inner`, `_rs`, `_c` stripped.
+6. **Fingerprint** — same `(arity, return_count, log2(loc))` *and* a shared token of ≥ 4 chars. Deliberately conservative; spurious matches from short names were the #1 noise source.
 
 ### Metrics emitted per function
 
@@ -229,6 +230,7 @@ Stored in `FunctionAnalysis.metrics`:
 - `cognitive` — Sonar-style; penalizes nesting; else-if chains do **not** compound (fixed bug).
 - `halstead` — `{n1, n2, big_n1, big_n2, volume, difficulty}`.
 - `early_returns`, `goto_count`, `unsafe_blocks`.
+- `binary_operators` — the **binary operator set**: occurrence counts for the arithmetic (`+ - * / %`), shift (`<< >>`), bitwise (`& | ^ ~`), and logical (`&& || !`) operators. Counted by symbol from each operator node, so a *binary* `a & b` lands in `bit_and` even in languages that treat it as element-wise-logical, while a *unary* `*p` / `&x` / `-x` is excluded (only `~` / `!` are recorded from prefix position). The 14 counts feed the `compare` deviation score (each as its own `op_*` dimension, default weight 0.5) and prediction features. This is especially important for tracking **floating-point problems**: a mismatch in the arithmetic counts (`+ - * /`) between an original and its port is a strong signal that the order or set of float operations changed — exactly the kind of reassociation, dropped term, or substituted operation that silently shifts rounding and precision.
 
 Also captured per function: `enclosing_type` (impl-target in Rust, `class` in Python/Java/C++; `None` for free functions), `constants` (each with kind, textual form, parsed value, byte span), `calls` (callee name, count, span), `types_used`, `signature`, `attributes` (free-form language-specific bag: `static`, `inline`, `no_mangle`, `cfg`, etc.).
 
@@ -368,6 +370,7 @@ struct Metrics {
     early_returns: u32,
     goto_count: u32,        // goto (C), cycle/exit (Fortran), last/next/redo (Perl) — non-local jumps
     unsafe_blocks: u32,     // Rust only
+    binary_operators: BinaryOperatorSet,  // +,-,*,/,%,<<,>>,&,|,^,~,&&,||,! counted by symbol
 }
 ```
 
@@ -391,8 +394,8 @@ Each implementation is essentially a tree-sitter visitor that emits `FunctionAna
 Separate from analysis, in `complexity-compare`. Strategies tried in order:
 
 1. **Explicit mapping file** (YAML/TOML): `{ rust: "parse_header", c: "ph_parse" }`.
-2. **FFI attribute**: `#[no_mangle]` / `#[link_name]` → use `original_name` directly.
-3. **Extern block declarations**: for Rust callers, the extern block lists the C symbols; names match 1:1.
+2. **FFI/doc original name**: `#[no_mangle]`, `#[link_name]`, or Rust doc comments of the form `Matches C++ \`Qualified::name(args)\`` → use `original_name` directly.
+3. **Qualified method convention**: C++ `Type::method` ↔ Rust `impl Type { fn method(...) }`, with constructors mapped to `new`/`default` and destructors to `drop` when implemented.
 4. **Name normalization**: snake/camel-fold, strip `_impl`, `_inner`, module prefixes.
 5. **Signature + metric fingerprint**: arity, return kind, LOC bucket — break ties.
 

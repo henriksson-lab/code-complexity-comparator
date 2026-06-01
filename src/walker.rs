@@ -3,8 +3,9 @@
 //! final metric computation uniformly across languages.
 
 use crate::core::{
-    classify_type, Call, Constant, FunctionAnalysis, Halstead, Location, Metrics, Signature,
-    StructAnalysis, StructField, StructMetrics, TypeRef,
+    classify_type, ArgExpr, BinaryOperatorSet, Call, CallSite, CmpOp, Constant, FunctionAnalysis,
+    Halstead, Location, Metrics, Predicate, Signature, StructAnalysis, StructField, StructMetrics,
+    Term, TypeRef,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -27,6 +28,8 @@ pub enum NodeClass {
     ShortCircuit,
     /// Ternary ? : ; +1 cyclomatic.
     Ternary,
+    /// Rust `?` propagation. It is one conditional early-exit branch.
+    TryPropagate,
     /// Function/method call.
     Call,
     /// Return statement.
@@ -69,6 +72,16 @@ pub trait LanguageSpec: Send + Sync {
     /// Extract the callee name from a Call-classified node.
     fn call_callee(&self, node: Node, src: &[u8]) -> Option<String>;
 
+    /// Return the named child nodes that represent each positional argument
+    /// of a Call-classified node, in source order. The walker lowers each
+    /// returned node into an `ArgExpr` for cross-translation comparison.
+    /// Default is empty: a language without coverage simply records call
+    /// sites with no `args`, and downstream argument-flow checks degrade to
+    /// "uncheckable" for that side. New languages can opt in incrementally.
+    fn call_args<'tree>(&self, _node: Node<'tree>, _src: &[u8]) -> Vec<Node<'tree>> {
+        Vec::new()
+    }
+
     /// Extract parameter list + return type for a Function node.
     fn signature(&self, node: Node, src: &[u8]) -> Signature;
 
@@ -79,9 +92,11 @@ pub trait LanguageSpec: Send + Sync {
 
     /// Parse a Float literal.
     fn parse_float(&self, text: &str) -> Option<f64> {
-        text.trim_end_matches(|c: char| c == 'f' || c == 'F' || c == 'L' || c == 'l' || c == 'd' || c == 'D')
-            .parse()
-            .ok()
+        text.trim_end_matches(|c: char| {
+            c == 'f' || c == 'F' || c == 'L' || c == 'l' || c == 'd' || c == 'D'
+        })
+        .parse()
+        .ok()
     }
 
     /// Parse a string literal into its decoded content.
@@ -171,7 +186,10 @@ fn parse_int_default(text: &str) -> Option<i64> {
         }
         break;
     }
-    let digits: String = body[..end].chars().filter(|c| *c != '_' && *c != '\'').collect();
+    let digits: String = body[..end]
+        .chars()
+        .filter(|c| *c != '_' && *c != '\'')
+        .collect();
     if digits.is_empty() {
         return None;
     }
@@ -188,7 +206,11 @@ fn decode_string_default(text: &str) -> Option<String> {
     // content between outermost matching quotes; fall back to raw text.
     let t = text.trim();
     // handle raw rust: r"..." or r#"..."#
-    if let Some(rest) = t.strip_prefix('r').or_else(|| t.strip_prefix('b').filter(|_| t.starts_with("br")).map(|_| &t[2..])) {
+    if let Some(rest) = t.strip_prefix('r').or_else(|| {
+        t.strip_prefix('b')
+            .filter(|_| t.starts_with("br"))
+            .map(|_| &t[2..])
+    }) {
         if rest.starts_with('#') || rest.starts_with('"') {
             let hashes = rest.chars().take_while(|c| *c == '#').count();
             let after_hash = &rest[hashes..];
@@ -236,9 +258,15 @@ fn unescape_simple(s: &str) -> String {
 pub struct Acc {
     pub constants: Vec<Constant>,
     pub calls_map: HashMap<String, (u32, (u32, u32))>,
+    pub call_sites: Vec<CallSite>,
+    /// Parameter-name → 0-based index in the enclosing function's signature.
+    /// Populated once at `analyze_function` entry; used by `lower_arg_expr`
+    /// to recognise parameter forwarding at call sites.
+    pub params: HashMap<String, u32>,
     pub types_used: HashSet<String>,
     pub operators: HashMap<String, u32>,
     pub operands: HashMap<String, u32>,
+    pub binary_operators: BinaryOperatorSet,
     pub comment_lines: HashSet<u32>,
     pub code_lines: HashSet<u32>,
     pub asm_lines: HashSet<u32>,
@@ -264,9 +292,12 @@ impl Acc {
         Self {
             constants: Vec::new(),
             calls_map: HashMap::new(),
+            call_sites: Vec::new(),
+            params: HashMap::new(),
             types_used: HashSet::new(),
             operators: HashMap::new(),
             operands: HashMap::new(),
+            binary_operators: BinaryOperatorSet::default(),
             comment_lines: HashSet::new(),
             code_lines: HashSet::new(),
             asm_lines: HashSet::new(),
@@ -304,9 +335,17 @@ pub fn analyze_function<S: LanguageSpec>(
     let mut acc = Acc::new(node);
     acc.inputs = signature.inputs.len() as u32;
     acc.outputs = signature.outputs.len() as u32;
+    for (i, p) in signature.inputs.iter().enumerate() {
+        // Skip placeholder names ("_", empty) — those would alias every
+        // ignored binding in the body and produce false `Param` matches.
+        if !p.name.is_empty() && p.name != "_" {
+            acc.params.insert(p.name.clone(), i as u32);
+        }
+    }
 
     // Walk the body (entire function node).
-    walk(spec, node, src, &mut acc, 0, 0, 0, 0);
+    let mut walk_ctx = WalkCtx::default();
+    walk(spec, node, src, &mut acc, 0, 0, 0, 0, &mut walk_ctx);
 
     // Finalize: derive per-line tallies.
     let sr = node.start_position().row as u32;
@@ -342,6 +381,13 @@ pub fn analyze_function<S: LanguageSpec>(
     let calls_unique = calls.len() as u32;
     let calls_total = acc.calls_total;
 
+    let mut early_returns = acc.early_returns;
+    if let Some(last_return_pos) = acc.last_return_pos {
+        if is_trailing_return(src, last_return_pos, acc.fn_end_byte) {
+            early_returns = early_returns.saturating_sub(1);
+        }
+    }
+
     let metrics = Metrics {
         loc_code,
         loc_comments,
@@ -358,9 +404,10 @@ pub fn analyze_function<S: LanguageSpec>(
         cyclomatic: acc.cyclomatic,
         cognitive: acc.cognitive,
         halstead,
-        early_returns: acc.early_returns,
+        early_returns,
         goto_count: acc.goto_count,
         unsafe_blocks: acc.unsafe_blocks,
+        binary_operators: acc.binary_operators,
     };
 
     let types_used: Vec<TypeRef> = {
@@ -389,9 +436,29 @@ pub fn analyze_function<S: LanguageSpec>(
         metrics,
         constants: acc.constants,
         calls,
+        call_sites: acc.call_sites,
         types_used,
         attributes,
     })
+}
+
+/// Per-walk mutable context. Bundling this saves us from threading a fresh
+/// `&mut` parameter through every recursive call each time the IR grows
+/// (today: guard stack + switch-value stack; tomorrow possibly loop guards
+/// or per-branch fact tables).
+#[derive(Default)]
+pub struct WalkCtx {
+    /// Path-condition guards from every enclosing `if` true-branch, the
+    /// negation of every enclosing `if` else-branch, every enclosing
+    /// `case` arm, etc. ANDed together at each call site to form the
+    /// `CallSite.path_cond`.
+    pub guard_stack: Vec<Predicate>,
+    /// Switch / match values being compared against. When entering a
+    /// `case` arm, the walker pops the top entry to build `Cmp(Eq, value,
+    /// case_value)` and pushes that on `guard_stack`. Stack so nested
+    /// switches (rare but legal) keep the right value paired with each
+    /// case arm.
+    pub switch_stack: Vec<Term>,
 }
 
 fn walk<S: LanguageSpec>(
@@ -403,6 +470,7 @@ fn walk<S: LanguageSpec>(
     loop_d: u32,
     comb_d: u32,
     cog_nesting: u32,
+    ctx: &mut WalkCtx,
 ) {
     let class = spec.classify(&node, src);
 
@@ -438,6 +506,7 @@ fn walk<S: LanguageSpec>(
                 | NodeClass::BoolLit(_)
                 | NodeClass::Operator
                 | NodeClass::Keyword
+                | NodeClass::TryPropagate
                 | NodeClass::Return
                 | NodeClass::Goto
                 | NodeClass::Call => {
@@ -512,11 +581,19 @@ fn walk<S: LanguageSpec>(
             acc.branches += 1;
             acc.cyclomatic += 1;
             acc.cognitive += 1;
+            record_binary_operator(node, src, &mut acc.binary_operators);
         }
         NodeClass::Ternary => {
             acc.branches += 1;
             acc.cyclomatic += 1;
             acc.cognitive += 1 + cog_nesting;
+        }
+        NodeClass::TryPropagate => {
+            acc.branches += 1;
+            acc.cyclomatic += 1;
+            acc.cognitive += 1 + cog_nesting;
+            acc.early_returns += 1;
+            *acc.operators.entry("?".to_string()).or_insert(0) += 1;
         }
         NodeClass::Return => {
             acc.last_return_pos = Some(node.end_byte() as u32);
@@ -536,8 +613,34 @@ fn walk<S: LanguageSpec>(
             acc.calls_total += 1;
             if let Some(callee) = spec.call_callee(node, src) {
                 let span = (node.start_byte() as u32, node.end_byte() as u32);
-                let ent = acc.calls_map.entry(callee).or_insert((0, span));
+                let ent = acc.calls_map.entry(callee.clone()).or_insert((0, span));
                 ent.0 += 1;
+                let arg_nodes = spec.call_args(node, src);
+                let args: Vec<ArgExpr> = arg_nodes
+                    .into_iter()
+                    .map(|a| lower_arg_expr(spec, a, src, &acc.params))
+                    .collect();
+                let path_cond = match ctx.guard_stack.len() {
+                    0 => None,
+                    1 => Some(ctx.guard_stack[0].clone().canonicalize()),
+                    // Build the conjunction and let canonicalize flatten /
+                    // sort / dedup, so two translations with the same set
+                    // of guards in different nesting order produce the
+                    // same shape.
+                    _ => Some(
+                        Predicate::And {
+                            items: ctx.guard_stack.clone(),
+                        }
+                        .canonicalize(),
+                    ),
+                };
+                acc.call_sites.push(CallSite {
+                    callee,
+                    span,
+                    args,
+                    in_loop: loop_d > 0,
+                    path_cond,
+                });
             }
         }
         NodeClass::IntLit => {
@@ -603,8 +706,74 @@ fn walk<S: LanguageSpec>(
             if let Some(t) = spec.operator_text(node, src) {
                 *acc.operators.entry(t).or_insert(0) += 1;
             }
+            record_binary_operator(node, src, &mut acc.binary_operators);
         }
         _ => {}
+    }
+
+    // Custom subtree walks for nodes whose children are guarded differently.
+    // All three forms — `if`, `?:` ternary, and `switch`/`match` — diverge
+    // from the generic child-loop pattern; everything else falls through.
+    //
+    // Field names (`condition`, `consequence`, `alternative`, `value`) are
+    // stable across tree-sitter-c, tree-sitter-cpp, and tree-sitter-rust —
+    // we rely on that uniformity rather than adding language-specific
+    // dispatch methods whose default impl would just look up the same
+    // fields.
+    //
+    // `else if` chains "just work" without special-casing: the chained `if`
+    // shows up as a child of `else_clause` (or as the parent's
+    // `alternative` field), so the outer condition's negation is already
+    // on the guard stack when the inner condition gets pushed.
+    if matches!(class, NodeClass::If | NodeClass::Ternary) {
+        walk_if_or_ternary(
+            spec, node, src, acc, new_if, new_loop, new_comb, new_cog, ctx,
+        );
+        return;
+    }
+
+    // Switch / match: stash the value being switched on so case arms can
+    // build per-case predicates. Push on entry, pop on exit; nested
+    // switches stay paired correctly because of the stack discipline.
+    if matches!(node.kind(), "switch_statement" | "match_expression") {
+        let switch_term = node
+            .child_by_field_name("condition")
+            .or_else(|| node.child_by_field_name("value"))
+            .map(|n| lower_term(spec, n, src, &acc.params));
+        let pushed_switch = switch_term.is_some();
+        if let Some(t) = switch_term {
+            ctx.switch_stack.push(t);
+        }
+        // Generic child recursion below handles the body and case arms;
+        // SwitchCase entries pull the top switch term to build their
+        // per-case predicate. We don't `return` here — the regular child
+        // loop is what we want.
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if spec.classify(&child, src) == NodeClass::Function {
+                continue;
+            }
+            walk(
+                spec, child, src, acc, new_if, new_loop, new_comb, new_cog, ctx,
+            );
+        }
+        if pushed_switch {
+            ctx.switch_stack.pop();
+        }
+        return;
+    }
+
+    // Per-case-arm guard. When entering a `case_statement` (C) or
+    // `match_arm` (Rust), build the predicate `switch_value == case_value`
+    // (or Opaque for `default` / non-literal patterns) and push it for
+    // the duration of the case body's recursion.
+    let case_pred = if class == NodeClass::SwitchCase {
+        Some(case_predicate(spec, node, src, &acc.params, ctx))
+    } else {
+        None
+    };
+    if let Some(p) = &case_pred {
+        ctx.guard_stack.push(p.clone());
     }
 
     // Recurse over children.
@@ -614,16 +783,433 @@ fn walk<S: LanguageSpec>(
         if spec.classify(&child, src) == NodeClass::Function {
             continue;
         }
-        walk(spec, child, src, acc, new_if, new_loop, new_comb, new_cog);
+        walk(
+            spec, child, src, acc, new_if, new_loop, new_comb, new_cog, ctx,
+        );
+    }
+
+    if case_pred.is_some() {
+        ctx.guard_stack.pop();
     }
 }
 
-/// Post-process: the last `return` in a function is not an "early return".
-pub fn finalize_early_returns(analyses: &mut [FunctionAnalysis]) {
-    for fa in analyses.iter_mut() {
-        if fa.metrics.early_returns > 0 {
-            fa.metrics.early_returns = fa.metrics.early_returns.saturating_sub(1);
+/// Custom-walk an `if` or ternary `?:` node: condition with the unchanged
+/// stack, consequence with the predicate pushed, alternative with the
+/// negation pushed. Both forms expose the same field names in tree-sitter
+/// grammars we care about.
+fn walk_if_or_ternary<S: LanguageSpec>(
+    spec: &S,
+    node: Node,
+    src: &[u8],
+    acc: &mut Acc,
+    if_d: u32,
+    loop_d: u32,
+    comb_d: u32,
+    cog_nesting: u32,
+    ctx: &mut WalkCtx,
+) {
+    let cond_node = node.child_by_field_name("condition");
+    let pred = cond_node
+        .map(|c| lower_predicate(spec, c, src, &acc.params).canonicalize())
+        .unwrap_or(Predicate::Opaque {
+            text: String::new(),
+        });
+
+    // Walk the condition itself with the *current* stack — the call we care
+    // about hasn't been guarded by `pred` yet.
+    if let Some(c) = cond_node {
+        walk(spec, c, src, acc, if_d, loop_d, comb_d, cog_nesting, ctx);
+    }
+
+    if let Some(c) = node.child_by_field_name("consequence") {
+        ctx.guard_stack.push(pred.clone());
+        walk(spec, c, src, acc, if_d, loop_d, comb_d, cog_nesting, ctx);
+        ctx.guard_stack.pop();
+    }
+
+    if let Some(a) = node.child_by_field_name("alternative") {
+        let neg = Predicate::Not {
+            item: Box::new(pred),
         }
+        .canonicalize();
+        ctx.guard_stack.push(neg);
+        walk(spec, a, src, acc, if_d, loop_d, comb_d, cog_nesting, ctx);
+        ctx.guard_stack.pop();
+    }
+}
+
+/// Build the path-condition predicate for a case arm. Pulls the switched-on
+/// term from the top of the switch stack and pairs it with the case's
+/// `value` (C) or `pattern` (Rust). Returns `Opaque` when:
+///
+/// - There's no switch on the stack (shouldn't happen in well-formed code,
+///   but defensive)
+/// - The case has no `value`/`pattern` field (i.e. C `default:`) — we
+///   *could* compute the negation of all sibling values, but that requires
+///   walking back up which complicates the stack discipline; for MVP we
+///   admit defeat and let `default:` arms be uncheckable.
+/// - The pattern doesn't lower to a clean term (Rust ranges, OR-patterns,
+///   struct destructuring, etc.) — `==` against a complex pattern is
+///   misleading, so we go opaque rather than guess.
+fn case_predicate<S: LanguageSpec>(
+    spec: &S,
+    case_node: Node,
+    src: &[u8],
+    params: &HashMap<String, u32>,
+    ctx: &WalkCtx,
+) -> Predicate {
+    let Some(switch_term) = ctx.switch_stack.last() else {
+        return Predicate::Opaque {
+            text: case_node.utf8_text(src).unwrap_or("").trim().to_string(),
+        };
+    };
+    // Check `pattern` (Rust `match_arm`) first: Rust's `match_arm` *also*
+    // has a `value` field — the body after `=>` — and grabbing that would
+    // turn the case predicate into a comparison against the body's text.
+    // C's `case_statement` only has `value`, so the fallback covers it.
+    let value_node = case_node
+        .child_by_field_name("pattern")
+        .or_else(|| case_node.child_by_field_name("value"));
+    let Some(v) = value_node else {
+        // C `default:` lands here. Mark uncheckable.
+        return Predicate::Opaque {
+            text: "<default>".to_string(),
+        };
+    };
+    let case_term = lower_term(spec, v, src, params);
+    if let Term::Opaque { text } = case_term {
+        // Pattern wasn't a literal/identifier we recognise (Rust range
+        // pattern, OR-pattern, struct pattern, …). Use a textual form
+        // so the comparator at least sees that *something* gates the call,
+        // but treats it as uncheckable for PathCondDrift.
+        return Predicate::Opaque { text };
+    }
+    Predicate::Cmp {
+        op: CmpOp::Eq,
+        left: switch_term.clone(),
+        right: case_term,
+    }
+    .canonicalize()
+}
+
+/// Compatibility hook retained for language analyzers that call it after
+/// walking a report. Early-return finalization now happens in
+/// `analyze_function`, where the source slice is still available and we can
+/// distinguish a truly trailing final return from an early return inside a
+/// `match`/`if` arm.
+pub fn finalize_early_returns(analyses: &mut [FunctionAnalysis]) {
+    let _ = analyses;
+}
+
+fn is_trailing_return(src: &[u8], return_end: u32, fn_end: u32) -> bool {
+    let start = return_end as usize;
+    let end = (fn_end as usize).min(src.len());
+    if start >= end {
+        return true;
+    }
+    src[start..end]
+        .iter()
+        .all(|b| b.is_ascii_whitespace() || matches!(*b, b';' | b'}' | b')'))
+}
+
+/// Tally a node's operator into the binary-operator-set fingerprint. Reads the
+/// node's `operator` field (the symbol token) — a convention shared by the
+/// `binary_expression` / `unary_expression` / `boolean_operator` nodes across
+/// the tree-sitter grammars we target — and classifies it by symbol.
+///
+/// Prefix uses are distinguished by node kind so a unary `*` (deref), `&`
+/// (address-of), `-` (negation) or `+` are *not* miscounted as binary
+/// multiply / bitwise-and / subtract; only `!` and `~` are recorded from a
+/// prefix context. Nodes with no `operator` field (e.g. Python's keyword-only
+/// `not_operator`, plain assignments) contribute nothing.
+fn record_binary_operator(node: Node, src: &[u8], set: &mut BinaryOperatorSet) {
+    let kind = node.kind();
+    let is_unary = kind.contains("unary")
+        || matches!(
+            kind,
+            "pointer_expression"
+                | "reference_expression"
+                | "not_operator"
+                | "preinc_expression"
+                | "update_expression"
+        );
+    // Prefer the named `operator` field (C/C++/Java binary + unary, Rust
+    // binary, Python operators). tree-sitter-rust models a *prefix* operator
+    // as an anonymous leading token with no field, and Python's `not_operator`
+    // is a bare `not` keyword — for those unary cases fall back to the first
+    // child token.
+    let op_node = node
+        .child_by_field_name("operator")
+        .or_else(|| if is_unary { node.child(0) } else { None });
+    let Some(op_node) = op_node else {
+        return;
+    };
+    let Ok(sym) = op_node.utf8_text(src) else {
+        return;
+    };
+    set.record(sym.trim(), is_unary);
+}
+
+/// Lower a single argument node into an `ArgExpr`. Shallow on purpose: only
+/// the four shapes we can reason about cleanly are recognised — parameter
+/// forwarding, kinded literals, immediately-nested calls — and everything
+/// else falls into `Opaque(text)` rather than risking a false equivalence.
+/// Languages opt in by implementing `LanguageSpec::call_args`; the rest get
+/// empty `args` and downstream comparators treat them as uncheckable.
+pub fn lower_arg_expr<S: LanguageSpec>(
+    spec: &S,
+    node: Node,
+    src: &[u8],
+    params: &HashMap<String, u32>,
+) -> ArgExpr {
+    let class = spec.classify(&node, src);
+    let span = (node.start_byte() as u32, node.end_byte() as u32);
+    match class {
+        NodeClass::Identifier => {
+            if let Ok(text) = node.utf8_text(src) {
+                if let Some(idx) = params.get(text) {
+                    return ArgExpr::Param { index: *idx };
+                }
+            }
+        }
+        NodeClass::IntLit => {
+            if let Ok(text) = node.utf8_text(src) {
+                if let Some(v) = spec.parse_int(text) {
+                    return ArgExpr::Const {
+                        value: Constant::Int {
+                            value: v,
+                            text: text.to_string(),
+                            span,
+                        },
+                    };
+                }
+            }
+        }
+        NodeClass::FloatLit => {
+            if let Ok(text) = node.utf8_text(src) {
+                if let Some(v) = spec.parse_float(text) {
+                    return ArgExpr::Const {
+                        value: Constant::Float {
+                            value: v,
+                            text: text.to_string(),
+                            span,
+                        },
+                    };
+                }
+            }
+        }
+        NodeClass::StrLit => {
+            if let Ok(text) = node.utf8_text(src) {
+                if let Some(v) = spec.parse_string(text) {
+                    return ArgExpr::Const {
+                        value: Constant::String { value: v, span },
+                    };
+                }
+            }
+        }
+        NodeClass::CharLit => {
+            if let Ok(text) = node.utf8_text(src) {
+                let v = text.trim_matches('\'').to_string();
+                return ArgExpr::Const {
+                    value: Constant::Char { value: v, span },
+                };
+            }
+        }
+        NodeClass::BoolLit(v) => {
+            return ArgExpr::Const {
+                value: Constant::Bool { value: v, span },
+            };
+        }
+        NodeClass::Call => {
+            if let Some(callee) = spec.call_callee(node, src) {
+                return ArgExpr::NestedCall { callee };
+            }
+        }
+        _ => {}
+    }
+    ArgExpr::Opaque {
+        text: node.utf8_text(src).unwrap_or("").trim().to_string(),
+    }
+}
+
+/// Lower a `Term` from an expression node — same shallow recognition as
+/// `lower_arg_expr` but emitting the predicate-side `Term` enum. Locals
+/// and unrecognised shapes go to `Opaque`; the caller treats `Opaque`
+/// terms as a signal to mark the surrounding predicate uncheckable.
+fn lower_term<S: LanguageSpec>(
+    spec: &S,
+    node: Node,
+    src: &[u8],
+    params: &HashMap<String, u32>,
+) -> Term {
+    // Strip wrappers so the case-arm pattern lowering gets through to the
+    // literal underneath. The set is small and grammar-stable:
+    //
+    // - `parenthesized_expression`  (C / Rust)
+    // - `match_pattern` / `literal_pattern`  (Rust `match_arm` patterns —
+    //   the literal `1` in `1 => ...` is wrapped one or two layers deep
+    //   depending on tree-sitter-rust version)
+    if matches!(
+        node.kind(),
+        "parenthesized_expression" | "match_pattern" | "literal_pattern"
+    ) {
+        if let Some(inner) = node.named_child(0) {
+            return lower_term(spec, inner, src, params);
+        }
+    }
+    let class = spec.classify(&node, src);
+    let span = (node.start_byte() as u32, node.end_byte() as u32);
+    match class {
+        NodeClass::Identifier => {
+            if let Ok(text) = node.utf8_text(src) {
+                if let Some(idx) = params.get(text) {
+                    return Term::Param { index: *idx };
+                }
+            }
+        }
+        NodeClass::IntLit => {
+            if let Ok(text) = node.utf8_text(src) {
+                if let Some(v) = spec.parse_int(text) {
+                    return Term::Const {
+                        value: Constant::Int {
+                            value: v,
+                            text: text.to_string(),
+                            span,
+                        },
+                    };
+                }
+            }
+        }
+        NodeClass::FloatLit => {
+            if let Ok(text) = node.utf8_text(src) {
+                if let Some(v) = spec.parse_float(text) {
+                    return Term::Const {
+                        value: Constant::Float {
+                            value: v,
+                            text: text.to_string(),
+                            span,
+                        },
+                    };
+                }
+            }
+        }
+        NodeClass::BoolLit(v) => {
+            return Term::Const {
+                value: Constant::Bool { value: v, span },
+            };
+        }
+        NodeClass::StrLit => {
+            if let Ok(text) = node.utf8_text(src) {
+                if let Some(v) = spec.parse_string(text) {
+                    return Term::Const {
+                        value: Constant::String { value: v, span },
+                    };
+                }
+            }
+        }
+        _ => {}
+    }
+    Term::Opaque {
+        text: node.utf8_text(src).unwrap_or("").trim().to_string(),
+    }
+}
+
+/// Lower an `if` (or boolean) condition node into a `Predicate`. Recognises:
+///
+/// - Comparisons: `binary_expression` whose `operator` field is one of
+///   `<`, `<=`, `==`, `!=`, `>`, `>=`. Operands lowered via `lower_term`.
+/// - Boolean conjunctions / disjunctions: `binary_expression` with `&&` /
+///   `||`, recurses on both sides.
+/// - Boolean negation: `unary_expression` with `!` / `not`, recurses on
+///   the inner.
+/// - Parenthesised expressions: descends through `parenthesized_expression`
+///   transparently.
+/// - Bool literals: `true` / `false`.
+/// - A bare identifier or expression: `Truthy(term)` — preserves the term
+///   without making any claim about its truth value.
+///
+/// Anything else falls into `Opaque(text)`, which the comparator treats as
+/// "uncheckable" and skips rather than flagging.
+fn lower_predicate<S: LanguageSpec>(
+    spec: &S,
+    node: Node,
+    src: &[u8],
+    params: &HashMap<String, u32>,
+) -> Predicate {
+    // Descend through trivial wrappers. Both tree-sitter-c and
+    // tree-sitter-rust use `parenthesized_expression`; if anyone adds
+    // another it should be safe to add here.
+    if matches!(node.kind(), "parenthesized_expression") {
+        if let Some(inner) = node.named_child(0) {
+            return lower_predicate(spec, inner, src, params);
+        }
+    }
+
+    let class = spec.classify(&node, src);
+    match class {
+        NodeClass::BoolLit(true) => return Predicate::True,
+        NodeClass::BoolLit(false) => return Predicate::False,
+        _ => {}
+    }
+
+    // Boolean unary `!cond` — both grammars expose the inner via the
+    // `argument` field on `unary_expression`. The classifier reports
+    // unary as `Operator`, so we don't gate on class — we just check the
+    // node kind.
+    if matches!(node.kind(), "unary_expression") {
+        if let Some(op) = node.child_by_field_name("operator") {
+            let op_kind = op.kind();
+            if op_kind == "!" {
+                if let Some(inner) = node.child_by_field_name("argument") {
+                    return Predicate::Not {
+                        item: Box::new(lower_predicate(spec, inner, src, params)),
+                    };
+                }
+            }
+        }
+    }
+
+    // Binary expression: comparison or short-circuit boolean.
+    if matches!(node.kind(), "binary_expression") {
+        let op = node.child_by_field_name("operator");
+        let left = node.child_by_field_name("left");
+        let right = node.child_by_field_name("right");
+        if let (Some(op), Some(l), Some(r)) = (op, left, right) {
+            let op_kind = op.kind();
+            if let Some(cmp) = CmpOp::from_str(op_kind) {
+                return Predicate::Cmp {
+                    op: cmp,
+                    left: lower_term(spec, l, src, params),
+                    right: lower_term(spec, r, src, params),
+                };
+            }
+            if op_kind == "&&" {
+                return Predicate::And {
+                    items: vec![
+                        lower_predicate(spec, l, src, params),
+                        lower_predicate(spec, r, src, params),
+                    ],
+                };
+            }
+            if op_kind == "||" {
+                return Predicate::Or {
+                    items: vec![
+                        lower_predicate(spec, l, src, params),
+                        lower_predicate(spec, r, src, params),
+                    ],
+                };
+            }
+        }
+    }
+
+    // Bare term used as a boolean (`if (flag)` / `if x { ... }`).
+    let term = lower_term(spec, node, src, params);
+    if matches!(term, Term::Opaque { .. }) {
+        Predicate::Opaque {
+            text: node.utf8_text(src).unwrap_or("").trim().to_string(),
+        }
+    } else {
+        Predicate::Truthy { term }
     }
 }
 
@@ -805,10 +1391,7 @@ mod parse_int_tests {
     fn signed_overflow_wraps_into_i64() {
         // 0x8000000000000000 is i64::MIN as a u64; we round-trip through u64
         // and reinterpret, so this should not return None.
-        assert_eq!(
-            parse_int_default("0x8000000000000000"),
-            Some(i64::MIN)
-        );
+        assert_eq!(parse_int_default("0x8000000000000000"), Some(i64::MIN));
     }
 
     #[test]

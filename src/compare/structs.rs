@@ -172,7 +172,11 @@ pub fn struct_deviation_rows(
             per_category: per,
         });
     }
-    rows.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
+    rows.sort_by(|a, b| {
+        b.total
+            .partial_cmp(&a.total)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     rows
 }
 
@@ -221,11 +225,7 @@ pub struct StructMissingReport {
     pub extra_in_rust: Vec<String>,
 }
 
-pub fn struct_missing(
-    rust: &Report,
-    other: &Report,
-    m: &StructMatchResult,
-) -> StructMissingReport {
+pub fn struct_missing(rust: &Report, other: &Report, m: &StructMatchResult) -> StructMissingReport {
     let matched_rust: HashSet<&str> = m.pairs.iter().map(|p| p.rust.name.as_str()).collect();
     let matched_other: HashSet<&str> = m.pairs.iter().map(|p| p.other.name.as_str()).collect();
     let missing_in_rust = other

@@ -66,8 +66,26 @@ pub fn draw(f: &mut Frame, app: &App) {
         HighlightMode::IdentityShared => build_identity_colors(left, right),
     };
 
-    draw_pane(f, panes[0], "rust", left, pair, app, &id_colors, PaneSide::Rust);
-    draw_pane(f, panes[1], lang_label(pair), right, pair, app, &id_colors, PaneSide::Other);
+    draw_pane(
+        f,
+        panes[0],
+        "rust",
+        left,
+        pair,
+        app,
+        &id_colors,
+        PaneSide::Rust,
+    );
+    draw_pane(
+        f,
+        panes[1],
+        lang_label(pair),
+        right,
+        pair,
+        app,
+        &id_colors,
+        PaneSide::Other,
+    );
 
     draw_stats(f, stats[0], left.and_then(|x| x.metrics.as_ref()));
     draw_stats(f, stats[1], right.and_then(|x| x.metrics.as_ref()));
@@ -113,7 +131,13 @@ fn draw_title(f: &mut Frame, area: Rect, app: &App) {
                 )
             })
             .unwrap_or_else(|| format!("{} [missing]", p.other_target));
-        format!("pair {}/{}   rust: {}    other: {}", app.idx + 1, app.pairs.len(), rl, ol)
+        format!(
+            "pair {}/{}   rust: {}    other: {}",
+            app.idx + 1,
+            app.pairs.len(),
+            rl,
+            ol
+        )
     } else {
         "no pairs".to_string()
     };
@@ -309,12 +333,16 @@ fn style_for(t: &Token, mode: HighlightMode, id_colors: &HashMap<String, Color>)
 
 fn language_style(kind: TokenKind) -> Style {
     match kind {
-        TokenKind::Keyword => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        TokenKind::Keyword => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
         TokenKind::Type => Style::default().fg(Color::Cyan),
         TokenKind::Identifier => Style::default().fg(Color::White),
         TokenKind::String => Style::default().fg(Color::Green),
         TokenKind::Number => Style::default().fg(Color::LightMagenta),
-        TokenKind::Comment => Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        TokenKind::Comment => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
         TokenKind::Operator => Style::default().fg(Color::LightBlue),
         TokenKind::Punctuation => Style::default().fg(Color::Gray),
         TokenKind::Other => Style::default(),

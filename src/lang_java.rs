@@ -1,10 +1,10 @@
-use anyhow::{anyhow, Result};
 use crate::analyzer::LanguageAnalyzer;
 use crate::core::{hash_source, Language, Param, Report, Signature, TypeRef};
 use crate::walker::{
     analyze_function, collect_functions, collect_structs, finalize_early_returns, LanguageSpec,
     NodeClass,
 };
+use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
 use std::path::Path;
 use tree_sitter::{Node, Parser};
@@ -12,24 +12,34 @@ use tree_sitter::{Node, Parser};
 pub struct JavaAnalyzer;
 
 impl JavaAnalyzer {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl Default for JavaAnalyzer {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LanguageAnalyzer for JavaAnalyzer {
-    fn language(&self) -> Language { Language::Java }
+    fn language(&self) -> Language {
+        Language::Java
+    }
 
-    fn extensions(&self) -> &[&'static str] { &["java"] }
+    fn extensions(&self) -> &[&'static str] {
+        &["java"]
+    }
 
     fn analyze_source(&self, src: &str, path: &Path) -> Result<Report> {
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_java::LANGUAGE.into())
             .map_err(|e| anyhow!("set language java: {}", e))?;
-        let tree = parser.parse(src, None).ok_or_else(|| anyhow!("parse failed"))?;
+        let tree = parser
+            .parse(src, None)
+            .ok_or_else(|| anyhow!("parse failed"))?;
         let src_bytes = src.as_bytes();
         let mut report = Report::new(Language::Java, path.to_path_buf(), hash_source(src));
 
@@ -42,7 +52,13 @@ impl LanguageAnalyzer for JavaAnalyzer {
             }
         }
         finalize_early_returns(&mut report.functions);
-        collect_structs(&spec, tree.root_node(), src_bytes, path, &mut report.structs);
+        collect_structs(
+            &spec,
+            tree.root_node(),
+            src_bytes,
+            path,
+            &mut report.structs,
+        );
         Ok(report)
     }
 }
@@ -54,18 +70,22 @@ impl LanguageSpec for JavaSpec {
         match node.kind() {
             "method_declaration" | "constructor_declaration" => NodeClass::Function,
             "if_statement" => NodeClass::If,
-            "while_statement" | "do_statement" | "for_statement" | "enhanced_for_statement" => NodeClass::Loop,
+            "while_statement" | "do_statement" | "for_statement" | "enhanced_for_statement" => {
+                NodeClass::Loop
+            }
             // Each case/default label + each catch clause is a decision point.
             "switch_label" | "switch_rule" | "catch_clause" => NodeClass::SwitchCase,
             "ternary_expression" => NodeClass::Ternary,
-            "method_invocation" | "object_creation_expression" | "explicit_constructor_invocation" => {
-                NodeClass::Call
-            }
+            "method_invocation"
+            | "object_creation_expression"
+            | "explicit_constructor_invocation" => NodeClass::Call,
             "return_statement" => NodeClass::Return,
             "throw_statement" => NodeClass::Return,
             "line_comment" | "block_comment" => NodeClass::Comment,
-            "decimal_integer_literal" | "hex_integer_literal"
-            | "octal_integer_literal" | "binary_integer_literal" => NodeClass::IntLit,
+            "decimal_integer_literal"
+            | "hex_integer_literal"
+            | "octal_integer_literal"
+            | "binary_integer_literal" => NodeClass::IntLit,
             "decimal_floating_point_literal" | "hex_floating_point_literal" => NodeClass::FloatLit,
             "string_literal" | "text_block" => NodeClass::StrLit,
             "character_literal" => NodeClass::CharLit,
@@ -81,7 +101,10 @@ impl LanguageSpec for JavaSpec {
                 }
                 NodeClass::Operator
             }
-            "unary_expression" | "update_expression" | "assignment_expression" | "cast_expression"
+            "unary_expression"
+            | "update_expression"
+            | "assignment_expression"
+            | "cast_expression"
             | "instanceof_expression" => NodeClass::Operator,
             "block" | "constructor_body" => NodeClass::Block,
             _ => NodeClass::None,
@@ -148,7 +171,10 @@ impl LanguageSpec for JavaSpec {
                             .and_then(|n| n.utf8_text(src).ok())
                             .unwrap_or("_")
                             .to_string();
-                        sig.inputs.push(Param { name, ty: TypeRef::new(ty) });
+                        sig.inputs.push(Param {
+                            name,
+                            ty: TypeRef::new(ty),
+                        });
                     }
                     _ => {}
                 }
@@ -164,7 +190,8 @@ impl LanguageSpec for JavaSpec {
             for m in mods.children(&mut cursor) {
                 match m.kind() {
                     "public" | "private" | "protected" | "static" | "final" | "abstract"
-                    | "synchronized" | "native" | "strictfp" | "default" | "transient" | "volatile" => {
+                    | "synchronized" | "native" | "strictfp" | "default" | "transient"
+                    | "volatile" => {
                         attrs.insert(m.kind().to_string(), "true".into());
                     }
                     "annotation" | "marker_annotation" => {

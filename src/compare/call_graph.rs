@@ -271,7 +271,10 @@ pub fn analyze_call_graph_diff(
     }
 }
 
-fn translated_edges(edges: &[Vec<usize>], pair_by_side: &HashMap<usize, usize>) -> HashSet<EdgeKey> {
+fn translated_edges(
+    edges: &[Vec<usize>],
+    pair_by_side: &HashMap<usize, usize>,
+) -> HashSet<EdgeKey> {
     let mut out = HashSet::new();
     for (&src_idx, &src_pair) in pair_by_side {
         for &dst_idx in &edges[src_idx] {
@@ -283,7 +286,10 @@ fn translated_edges(edges: &[Vec<usize>], pair_by_side: &HashMap<usize, usize>) 
     out
 }
 
-fn translated_neighbors(neighbors: &[usize], pair_by_side: &HashMap<usize, usize>) -> HashSet<usize> {
+fn translated_neighbors(
+    neighbors: &[usize],
+    pair_by_side: &HashMap<usize, usize>,
+) -> HashSet<usize> {
     neighbors
         .iter()
         .filter_map(|idx| pair_by_side.get(idx).copied())
@@ -328,7 +334,8 @@ fn edge_refs(edge_keys: &[EdgeKey], matches: &MatchResult<'_>, side: Side) -> Ve
         })
         .collect();
     out.sort_by(|a, b| {
-        a.src.file
+        a.src
+            .file
             .cmp(&b.src.file)
             .then(a.src.line_start.cmp(&b.src.line_start))
             .then(a.src.name.cmp(&b.src.name))
@@ -377,6 +384,7 @@ mod tests {
                     span: (0, 0),
                 })
                 .collect(),
+            call_sites: Vec::new(),
             types_used: Vec::new(),
             attributes: BTreeMap::new(),
         }
@@ -413,10 +421,23 @@ mod tests {
         );
         let mapping = Mapping {
             entries: vec![
-                MappingEntry { rust: "a".into(), other: "a_c".into(), ..Default::default() },
-                MappingEntry { rust: "b".into(), other: "b_c".into(), ..Default::default() },
-                MappingEntry { rust: "c".into(), other: "c_c".into(), ..Default::default() },
+                MappingEntry {
+                    rust: "a".into(),
+                    other: "a_c".into(),
+                    ..Default::default()
+                },
+                MappingEntry {
+                    rust: "b".into(),
+                    other: "b_c".into(),
+                    ..Default::default()
+                },
+                MappingEntry {
+                    rust: "c".into(),
+                    other: "c_c".into(),
+                    ..Default::default()
+                },
             ],
+            ..Default::default()
         };
         let matches = match_reports(&rust, &other, Some(&mapping));
 
@@ -431,10 +452,7 @@ mod tests {
     fn call_graph_diff_flags_recursive_shape_mismatches() {
         let rust = rep(
             Language::Rust,
-            vec![
-                fa("a", "src/a.rs", 1, &["a"]),
-                fa("b", "src/b.rs", 10, &[]),
-            ],
+            vec![fa("a", "src/a.rs", 1, &["a"]), fa("b", "src/b.rs", 10, &[])],
         );
         let other = rep(
             Language::C,
@@ -445,9 +463,18 @@ mod tests {
         );
         let mapping = Mapping {
             entries: vec![
-                MappingEntry { rust: "a".into(), other: "a_c".into(), ..Default::default() },
-                MappingEntry { rust: "b".into(), other: "b_c".into(), ..Default::default() },
+                MappingEntry {
+                    rust: "a".into(),
+                    other: "a_c".into(),
+                    ..Default::default()
+                },
+                MappingEntry {
+                    rust: "b".into(),
+                    other: "b_c".into(),
+                    ..Default::default()
+                },
             ],
+            ..Default::default()
         };
         let matches = match_reports(&rust, &other, Some(&mapping));
 

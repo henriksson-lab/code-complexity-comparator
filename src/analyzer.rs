@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::core::{Language, Report};
+use anyhow::Result;
 use std::path::Path;
 
 pub trait LanguageAnalyzer: Send + Sync {
@@ -8,8 +8,8 @@ pub trait LanguageAnalyzer: Send + Sync {
     fn analyze_source(&self, src: &str, path: &Path) -> Result<Report>;
 
     fn analyze_file(&self, path: &Path) -> Result<Report> {
-        let bytes = std::fs::read(path)
-            .map_err(|e| anyhow::anyhow!("read {}: {}", path.display(), e))?;
+        let bytes =
+            std::fs::read(path).map_err(|e| anyhow::anyhow!("read {}: {}", path.display(), e))?;
         let src = decode_source_lossy_preserve_offsets(&bytes);
         self.analyze_source(&src, path)
     }
@@ -64,7 +64,9 @@ pub struct Registry {
 
 impl Registry {
     pub fn new() -> Self {
-        Self { analyzers: Vec::new() }
+        Self {
+            analyzers: Vec::new(),
+        }
     }
 
     pub fn register(&mut self, a: Box<dyn LanguageAnalyzer>) {

@@ -73,11 +73,31 @@ pub fn norm_stats(r: &Report) -> NormStats {
         let var = v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / v.len() as f64;
         (m, var.sqrt().max(1e-9))
     }
-    let cognitive: Vec<f64> = r.functions.iter().map(|f| f.metrics.cognitive as f64).collect();
-    let nesting: Vec<f64> = r.functions.iter().map(|f| f.metrics.max_combined_nesting as f64).collect();
-    let calls: Vec<f64> = r.functions.iter().map(|f| f.metrics.calls_total as f64).collect();
-    let loc: Vec<f64> = r.functions.iter().map(|f| f.metrics.loc_code as f64).collect();
-    let halstead: Vec<f64> = r.functions.iter().map(|f| f.metrics.halstead.difficulty).collect();
+    let cognitive: Vec<f64> = r
+        .functions
+        .iter()
+        .map(|f| f.metrics.cognitive as f64)
+        .collect();
+    let nesting: Vec<f64> = r
+        .functions
+        .iter()
+        .map(|f| f.metrics.max_combined_nesting as f64)
+        .collect();
+    let calls: Vec<f64> = r
+        .functions
+        .iter()
+        .map(|f| f.metrics.calls_total as f64)
+        .collect();
+    let loc: Vec<f64> = r
+        .functions
+        .iter()
+        .map(|f| f.metrics.loc_code as f64)
+        .collect();
+    let halstead: Vec<f64> = r
+        .functions
+        .iter()
+        .map(|f| f.metrics.halstead.difficulty)
+        .collect();
     let (cm, cs) = mean_std(&cognitive);
     let (nm, ns) = mean_std(&nesting);
     let (km, ks) = mean_std(&calls);

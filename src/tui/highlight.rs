@@ -128,7 +128,16 @@ fn visit(
     }
     if cursor.goto_first_child() {
         loop {
-            visit(cursor, src, lang, byte_start, byte_end, fn_start_row, fn_start_col, out);
+            visit(
+                cursor,
+                src,
+                lang,
+                byte_start,
+                byte_end,
+                fn_start_row,
+                fn_start_col,
+                out,
+            );
             if !cursor.goto_next_sibling() {
                 break;
             }
@@ -252,7 +261,10 @@ fn classify(_lang: Language, node_kind: &str, parent_kind: Option<&str>, text: &
         }
     }
     // Operators and punctuation — symbolic tokens.
-    if !t.is_empty() && t.chars().all(|c| !c.is_alphanumeric() && !c.is_whitespace()) {
+    if !t.is_empty()
+        && t.chars()
+            .all(|c| !c.is_alphanumeric() && !c.is_whitespace())
+    {
         // Heuristic split: brackets and separators are punctuation; the rest
         // (arithmetic, comparison, assignment) are operators.
         if matches!(t, "(" | ")" | "[" | "]" | "{" | "}" | "," | ";" | ":" | ".") {

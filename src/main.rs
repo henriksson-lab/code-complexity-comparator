@@ -2,16 +2,17 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use code_complexity_comparator_rs::analyzer::{LanguageAnalyzer, Registry};
 use code_complexity_comparator_rs::compare::{
-    analyze_call_graph_diff, analyze_upstream, constants_diff, deviation_rows, load_report,
-    match_reports, match_structs, missing, sort_report, struct_deviation_rows, struct_missing,
-    FunctionSelector, Mapping, SortKey, Weights,
+    analyze_arg_flow, analyze_call_graph_diff, analyze_struct_field_diff, analyze_upstream,
+    constants_diff, deviation_rows, load_report, match_reports, match_structs, missing_with_ignore,
+    sort_report, struct_deviation_rows, struct_missing, FunctionSelector, Mapping, SortKey,
+    Weights,
 };
 use code_complexity_comparator_rs::core::{Language, Report};
 use code_complexity_comparator_rs::lang_c::CAnalyzer;
-use code_complexity_comparator_rs::lang_java::JavaAnalyzer;
-use code_complexity_comparator_rs::lang_python::PythonAnalyzer;
 use code_complexity_comparator_rs::lang_fortran::FortranAnalyzer;
+use code_complexity_comparator_rs::lang_java::JavaAnalyzer;
 use code_complexity_comparator_rs::lang_perl::PerlAnalyzer;
+use code_complexity_comparator_rs::lang_python::PythonAnalyzer;
 use code_complexity_comparator_rs::lang_r::RAnalyzer;
 use code_complexity_comparator_rs::lang_rust::RustAnalyzer;
 use code_complexity_comparator_rs::order;
@@ -21,7 +22,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
-#[command(name = "ccc-rs", about = "Static complexity analysis and cross-language comparison")]
+#[command(
+    name = "ccc-rs",
+    about = "Static complexity analysis and cross-language comparison"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -208,6 +212,37 @@ enum Cmd {
         #[arg(long, default_value = "table")]
         format: FormatArg,
     },
+    /// For each matched function pair, compare argument flow at every call
+    /// site: arity drift, constant drift, parameter forwarding skew (when a
+    /// per-pair parameter map can be inferred), in-loop deltas. Pairs whose
+    /// parameter map can't be inferred are listed separately so users can
+    /// add them to `ccc_mapping.toml` or rename for clarity.
+    ArgFlow {
+        rust: PathBuf,
+        other: PathBuf,
+        #[arg(long)]
+        mapping: Option<PathBuf>,
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+        #[arg(long, default_value = "table")]
+        format: FormatArg,
+    },
+    /// For each matched struct/class pair, compare fields one-by-one and
+    /// flag: **disabled in rust** (field name starts with `_` or type is a
+    /// placeholder like `()` / `PhantomData<…>`), **type mismatch** (same
+    /// field name on both sides but type categories disagree), **missing
+    /// in rust**, and **extra in rust**. Field counts are reported per
+    /// pair so arity differences are visible at a glance.
+    StructDiff {
+        rust: PathBuf,
+        other: PathBuf,
+        #[arg(long)]
+        mapping: Option<PathBuf>,
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+        #[arg(long, default_value = "table")]
+        format: FormatArg,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -302,38 +337,102 @@ fn build_registry() -> Registry {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Analyze { path, lang, out, recurse } => cmd_analyze(&path, lang, out.as_deref(), recurse),
-        Cmd::Compare { rust, other, mapping, sort, top, format } => {
+        Cmd::Analyze {
+            path,
+            lang,
+            out,
+            recurse,
+        } => cmd_analyze(&path, lang, out.as_deref(), recurse),
+        Cmd::Compare {
+            rust,
+            other,
+            mapping,
+            sort,
+            top,
+            format,
+        } => {
             let mapping = resolve_mapping(mapping);
             cmd_compare(&rust, &other, mapping.as_deref(), sort, top, format)
         }
-        Cmd::Missing { rust, other, mapping, stub_loc_ratio, format } => {
+        Cmd::Missing {
+            rust,
+            other,
+            mapping,
+            stub_loc_ratio,
+            format,
+        } => {
             let mapping = resolve_mapping(mapping);
             cmd_missing(&rust, &other, mapping.as_deref(), stub_loc_ratio, format)
         }
-        Cmd::Sort { report, by, top, format } => cmd_sort(&report, &by, top, format),
-        Cmd::ConstantsDiff { rust, other, mapping, top, format } => {
+        Cmd::Sort {
+            report,
+            by,
+            top,
+            format,
+        } => cmd_sort(&report, &by, top, format),
+        Cmd::ConstantsDiff {
+            rust,
+            other,
+            mapping,
+            top,
+            format,
+        } => {
             let mapping = resolve_mapping(mapping);
             cmd_constants_diff(&rust, &other, mapping.as_deref(), top, format)
         }
-        Cmd::CompareStructs { rust, other, mapping, top, format } => {
+        Cmd::CompareStructs {
+            rust,
+            other,
+            mapping,
+            top,
+            format,
+        } => {
             let mapping = resolve_mapping(mapping);
             cmd_compare_structs(&rust, &other, mapping.as_deref(), top, format)
         }
-        Cmd::MissingStructs { rust, other, mapping, format } => {
+        Cmd::MissingStructs {
+            rust,
+            other,
+            mapping,
+            format,
+        } => {
             let mapping = resolve_mapping(mapping);
             cmd_missing_structs(&rust, &other, mapping.as_deref(), format)
         }
-        Cmd::Order { path, lang, recurse, out, strict, merge } => {
-            cmd_order(&path, lang, recurse, out.as_deref(), strict, merge.as_deref())
-        }
-        Cmd::OrderAnnotate { csv, source, rust, mapping, out } => {
+        Cmd::Order {
+            path,
+            lang,
+            recurse,
+            out,
+            strict,
+            merge,
+        } => cmd_order(
+            &path,
+            lang,
+            recurse,
+            out.as_deref(),
+            strict,
+            merge.as_deref(),
+        ),
+        Cmd::OrderAnnotate {
+            csv,
+            source,
+            rust,
+            mapping,
+            out,
+        } => {
             let mapping = resolve_mapping(mapping);
             cmd_order_annotate(&csv, &source, &rust, mapping.as_deref(), out.as_deref())
         }
         Cmd::Predict { sub } => match sub {
             PredictCmd::Train { pairs_dir, model } => cmd_predict_train(&pairs_dir, &model),
-            PredictCmd::Apply { model, source, against, mapping, out } => {
+            PredictCmd::Apply {
+                model,
+                source,
+                against,
+                mapping,
+                out,
+            } => {
                 let mapping = resolve_mapping(mapping);
                 cmd_predict_apply(
                     &model,
@@ -344,15 +443,23 @@ fn main() -> Result<()> {
                 )
             }
         },
-        Cmd::CompareTui { mapping, rust_root, other_root, other_lang } => {
+        Cmd::CompareTui {
+            mapping,
+            rust_root,
+            other_root,
+            other_lang,
+        } => {
             let lang = match other_lang {
                 Some(l) => l.to_language(),
                 None => {
-                    let detected = code_complexity_comparator_rs::tui::detect_other_language(&other_root)
-                        .ok_or_else(|| anyhow!(
-                            "could not detect source language under {} — pass --other-lang",
-                            other_root.display()
-                        ))?;
+                    let detected =
+                        code_complexity_comparator_rs::tui::detect_other_language(&other_root)
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "could not detect source language under {} — pass --other-lang",
+                                    other_root.display()
+                                )
+                            })?;
                     eprintln!("auto-detected other-lang: {}", detected.as_str());
                     detected
                 }
@@ -396,27 +503,73 @@ fn main() -> Result<()> {
                 &rust,
                 &other,
                 mapping.as_deref(),
-                if rust_selector.is_empty() { None } else { Some(&rust_selector) },
-                if other_selector.is_empty() { None } else { Some(&other_selector) },
+                if rust_selector.is_empty() {
+                    None
+                } else {
+                    Some(&rust_selector)
+                },
+                if other_selector.is_empty() {
+                    None
+                } else {
+                    Some(&other_selector)
+                },
                 strict,
                 format,
             )
         }
-        Cmd::CallGraphDiff { rust, other, mapping, strict, top, format } => {
+        Cmd::CallGraphDiff {
+            rust,
+            other,
+            mapping,
+            strict,
+            top,
+            format,
+        } => {
             let mapping = resolve_mapping(mapping);
             cmd_call_graph_diff(&rust, &other, mapping.as_deref(), strict, top, format)
+        }
+        Cmd::ArgFlow {
+            rust,
+            other,
+            mapping,
+            top,
+            format,
+        } => {
+            let mapping = resolve_mapping(mapping);
+            cmd_arg_flow(&rust, &other, mapping.as_deref(), top, format)
+        }
+        Cmd::StructDiff {
+            rust,
+            other,
+            mapping,
+            top,
+            format,
+        } => {
+            let mapping = resolve_mapping(mapping);
+            cmd_struct_diff(&rust, &other, mapping.as_deref(), top, format)
         }
     }
 }
 
-fn cmd_analyze(path: &Path, lang: Option<LangArg>, out: Option<&Path>, recurse: bool) -> Result<()> {
+fn cmd_analyze(
+    path: &Path,
+    lang: Option<LangArg>,
+    out: Option<&Path>,
+    recurse: bool,
+) -> Result<()> {
     let reg = build_registry();
     let mut reports: Vec<Report> = Vec::new();
 
     if path.is_file() {
         reports.push(analyze_file(&reg, path, lang.map(|l| l.to_language()))?);
     } else if path.is_dir() {
-        collect_and_analyze_dir(&reg, path, lang.map(|l| l.to_language()), recurse, &mut reports)?;
+        collect_and_analyze_dir(
+            &reg,
+            path,
+            lang.map(|l| l.to_language()),
+            recurse,
+            &mut reports,
+        )?;
     } else {
         return Err(anyhow!("not a file or directory: {}", path.display()));
     }
@@ -427,7 +580,10 @@ fn cmd_analyze(path: &Path, lang: Option<LangArg>, out: Option<&Path>, recurse: 
     } else {
         let mut r = Report {
             schema_version: code_complexity_comparator_rs::core::SCHEMA_VERSION,
-            language: reports.first().map(|r| r.language).unwrap_or(Language::Unknown),
+            language: reports
+                .first()
+                .map(|r| r.language)
+                .unwrap_or(Language::Unknown),
             source_file: path.to_path_buf(),
             source_hash: String::new(),
             functions: Vec::new(),
@@ -443,7 +599,11 @@ fn cmd_analyze(path: &Path, lang: Option<LangArg>, out: Option<&Path>, recurse: 
     let json = serde_json::to_string_pretty(&merged)?;
     if let Some(p) = out {
         std::fs::write(p, json)?;
-        eprintln!("wrote {} ({} functions)", p.display(), merged.functions.len());
+        eprintln!(
+            "wrote {} ({} functions)",
+            p.display(),
+            merged.functions.len()
+        );
     } else {
         println!("{}", json);
     }
@@ -452,7 +612,9 @@ fn cmd_analyze(path: &Path, lang: Option<LangArg>, out: Option<&Path>, recurse: 
 
 fn analyze_file(reg: &Registry, path: &Path, lang: Option<Language>) -> Result<Report> {
     let analyzer: &dyn LanguageAnalyzer = match lang {
-        Some(l) => reg.for_language(l).ok_or_else(|| anyhow!("no analyzer for {:?}", l))?,
+        Some(l) => reg
+            .for_language(l)
+            .ok_or_else(|| anyhow!("no analyzer for {:?}", l))?,
         None => reg
             .for_path(path)
             .ok_or_else(|| anyhow!("no analyzer for extension of {}", path.display()))?,
@@ -524,7 +686,10 @@ fn cmd_compare(
             println!("{}", serde_json::to_string_pretty(&shown)?);
         }
         FormatArg::Table => {
-            println!("{:<30} {:<30} {:>8} top-contributors", "rust", "other", "deviation");
+            println!(
+                "{:<30} {:<30} {:>8} top-contributors",
+                "rust", "other", "deviation"
+            );
             for r in shown {
                 let contribs: Vec<String> = r
                     .per_metric
@@ -557,7 +722,7 @@ fn cmd_missing(
     let other_r = load_report(other)?;
     let map = mapping.map(Mapping::load).transpose()?;
     let m = match_reports(&rust_r, &other_r, map.as_ref());
-    let rep = missing(&rust_r, &other_r, &m, stub_loc_ratio);
+    let rep = missing_with_ignore(&rust_r, &other_r, &m, stub_loc_ratio, map.as_ref());
     match format {
         FormatArg::Json => println!("{}", serde_json::to_string_pretty(&rep)?),
         FormatArg::Table => {
@@ -571,7 +736,10 @@ fn cmd_missing(
             }
             println!("Partial/stubs ({}):", rep.partial.len());
             for p in &rep.partial {
-                println!("  ~ {} (rust) vs {} (other): {}", p.rust_name, p.other_name, p.reason);
+                println!(
+                    "  ~ {} (rust) vs {} (other): {}",
+                    p.rust_name, p.other_name, p.reason
+                );
             }
         }
     }
@@ -650,7 +818,10 @@ fn cmd_constants_diff(
                 if d.only_in_rust.is_empty() && d.only_in_other.is_empty() {
                     continue;
                 }
-                println!("== {} (rust) <-> {} (other) score={:.2} ==", d.rust_name, d.other_name, d.score);
+                println!(
+                    "== {} (rust) <-> {} (other) score={:.2} ==",
+                    d.rust_name, d.other_name, d.score
+                );
                 for c in &d.only_in_other {
                     println!("  - (other only) [{}] {}", c.kind, c.display);
                 }
@@ -742,7 +913,8 @@ fn cmd_missing_structs(
 
 fn cmd_predict_train(pairs_dir: &Path, model_path: &Path) -> Result<()> {
     let mut pairs: Vec<(Report, Report)> = Vec::new();
-    let mut by_base: std::collections::BTreeMap<String, (Option<PathBuf>, Option<PathBuf>)> = Default::default();
+    let mut by_base: std::collections::BTreeMap<String, (Option<PathBuf>, Option<PathBuf>)> =
+        Default::default();
     for entry in std::fs::read_dir(pairs_dir)? {
         let p = entry?.path();
         if p.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -776,7 +948,12 @@ fn cmd_predict_train(pairs_dir: &Path, model_path: &Path) -> Result<()> {
     }
     let model = train(&pairs)?;
     model.save(model_path)?;
-    eprintln!("saved model to {} ({} pairs, {} metrics)", model_path.display(), pairs.len(), model.per_metric.len());
+    eprintln!(
+        "saved model to {} ({} pairs, {} metrics)",
+        model_path.display(),
+        pairs.len(),
+        model.per_metric.len()
+    );
     Ok(())
 }
 
@@ -819,7 +996,13 @@ fn cmd_order(
         if path.is_file() {
             reports.push(analyze_file(&reg, path, lang.map(|l| l.to_language()))?);
         } else if path.is_dir() {
-            collect_and_analyze_dir(&reg, path, lang.map(|l| l.to_language()), recurse, &mut reports)?;
+            collect_and_analyze_dir(
+                &reg,
+                path,
+                lang.map(|l| l.to_language()),
+                recurse,
+                &mut reports,
+            )?;
         } else {
             return Err(anyhow!(
                 "not a file, directory, or .json report: {}",
@@ -829,7 +1012,10 @@ fn cmd_order(
         if reports.is_empty() {
             return Err(anyhow!("no files analyzed under {}", path.display()));
         }
-        let language = reports.first().map(|r| r.language).unwrap_or(Language::Unknown);
+        let language = reports
+            .first()
+            .map(|r| r.language)
+            .unwrap_or(Language::Unknown);
         let mut merged = Report {
             schema_version: code_complexity_comparator_rs::core::SCHEMA_VERSION,
             language,
@@ -984,7 +1170,10 @@ fn cmd_upstream(
                     contribs.join(", ")
                 );
             }
-            println!("({} translated pairs touching the upstream sets)", analysis.pairs.len());
+            println!(
+                "({} translated pairs touching the upstream sets)",
+                analysis.pairs.len()
+            );
         }
     }
     Ok(())
@@ -1018,13 +1207,11 @@ fn cmd_call_graph_diff(
             );
             println!(
                 "Edge differences: only-in-rust={} only-in-other={}",
-                analysis.summary.edges_only_in_rust,
-                analysis.summary.edges_only_in_other
+                analysis.summary.edges_only_in_rust, analysis.summary.edges_only_in_other
             );
             println!(
                 "Recursion mismatches: kind={} scc-size={}",
-                analysis.summary.recursive_kind_mismatches,
-                analysis.summary.scc_size_mismatches
+                analysis.summary.recursive_kind_mismatches, analysis.summary.scc_size_mismatches
             );
             println!(
                 "Ambiguous/unresolved call sites: rust={}/{} other={}/{}",
@@ -1035,7 +1222,10 @@ fn cmd_call_graph_diff(
             );
 
             if !analysis.edges_only_in_rust.is_empty() {
-                println!("Edges only in rust (showing {}):", analysis.edges_only_in_rust.len());
+                println!(
+                    "Edges only in rust (showing {}):",
+                    analysis.edges_only_in_rust.len()
+                );
                 for edge in &analysis.edges_only_in_rust {
                     println!(
                         "  - {} @ {}:{} -> {} @ {}:{}",
@@ -1049,7 +1239,10 @@ fn cmd_call_graph_diff(
                 }
             }
             if !analysis.edges_only_in_other.is_empty() {
-                println!("Edges only in other (showing {}):", analysis.edges_only_in_other.len());
+                println!(
+                    "Edges only in other (showing {}):",
+                    analysis.edges_only_in_other.len()
+                );
                 for edge in &analysis.edges_only_in_other {
                     println!(
                         "  - {} @ {}:{} -> {} @ {}:{}",
@@ -1093,4 +1286,172 @@ fn truncate(s: &str, n: usize) -> String {
     } else {
         format!("{}…", &s[..n - 1])
     }
+}
+
+fn cmd_arg_flow(
+    rust: &Path,
+    other: &Path,
+    mapping: Option<&Path>,
+    top: usize,
+    format: FormatArg,
+) -> Result<()> {
+    let rust_r = load_report(rust)?;
+    let other_r = load_report(other)?;
+    let map = mapping.map(Mapping::load).transpose()?;
+    let matches = match_reports(&rust_r, &other_r, map.as_ref());
+    let analysis = analyze_arg_flow(&matches, map.as_ref());
+
+    match format {
+        FormatArg::Json => {
+            // For JSON we emit the full structure; the caller can `jq` for
+            // top-N. Truncating in JSON mode would silently drop findings
+            // that machine consumers expected.
+            println!("{}", serde_json::to_string_pretty(&analysis)?);
+        }
+        FormatArg::Table => {
+            let s = &analysis.summary;
+            println!(
+                "Matched pairs: {}  (param-map: {}, unresolved: {})",
+                s.matched_pairs, s.pairs_with_param_map, s.pairs_unresolved
+            );
+            println!("Total findings: {}", s.total_findings);
+            if !s.findings_by_kind.is_empty() {
+                let mut kinds: Vec<_> = s.findings_by_kind.iter().collect();
+                kinds.sort_by(|a, b| b.1.cmp(a.1));
+                let parts: Vec<String> =
+                    kinds.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+                println!("  by kind: {}", parts.join(", "));
+            }
+
+            // Top pairs by score. Pairs with score 0 (no findings, including
+            // unresolved-no-tier-2 pairs) are deliberately shown last; users
+            // mostly want to see what fired.
+            let pairs_with_findings: Vec<_> = analysis
+                .pairs
+                .iter()
+                .filter(|p| !p.findings.is_empty())
+                .take(top)
+                .collect();
+            if !pairs_with_findings.is_empty() {
+                println!(
+                    "\nTop {} pairs by mismatch score:",
+                    pairs_with_findings.len()
+                );
+                for p in pairs_with_findings {
+                    let map_tag = match &p.parameter_map {
+                        Some(m) => format!("[{:?}]", m.source).to_lowercase(),
+                        None => "[no-map]".to_string(),
+                    };
+                    println!(
+                        "\n== {} ↔ {}  score={:.1}  {}  rust_calls={} other_calls={}",
+                        truncate(&p.rust.name, 35),
+                        truncate(&p.other.name, 35),
+                        p.score,
+                        map_tag,
+                        p.call_site_count_rust,
+                        p.call_site_count_other,
+                    );
+                    for f in &p.findings {
+                        println!("  [{:>16}] {}: {}", f.kind.name(), f.callee, f.detail);
+                    }
+                }
+            } else {
+                println!("\nNo findings.");
+            }
+
+            if !analysis.unresolved_pairs.is_empty() {
+                let n = analysis.unresolved_pairs.len().min(top);
+                eprintln!(
+                    "\nParameter mapping unresolved for {} pair(s) (tier-2 skipped).",
+                    analysis.unresolved_pairs.len()
+                );
+                eprintln!(
+                    "Add to ccc_mapping.toml or rename params. Top {} by call activity:",
+                    n
+                );
+                for u in analysis.unresolved_pairs.iter().take(n) {
+                    eprintln!(
+                        "  {} ↔ {}  ({})  rust_calls={} other_calls={}",
+                        truncate(&u.rust.name, 35),
+                        truncate(&u.other.name, 35),
+                        u.reason.human(),
+                        u.call_site_count_rust,
+                        u.call_site_count_other,
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_struct_diff(
+    rust: &Path,
+    other: &Path,
+    mapping: Option<&Path>,
+    top: usize,
+    format: FormatArg,
+) -> Result<()> {
+    let rust_r = load_report(rust)?;
+    let other_r = load_report(other)?;
+    let map = mapping.map(Mapping::load).transpose()?;
+    let matches = match_structs(&rust_r, &other_r, map.as_ref());
+    let analysis = analyze_struct_field_diff(&matches, map.as_ref());
+
+    match format {
+        FormatArg::Json => {
+            println!("{}", serde_json::to_string_pretty(&analysis)?);
+        }
+        FormatArg::Table => {
+            let s = &analysis.summary;
+            println!(
+                "Matched struct pairs: {}  (with findings: {}, arity-mismatched: {})",
+                s.matched_pairs, s.pairs_with_findings, s.pairs_with_arity_mismatch
+            );
+            println!("Total findings: {}", s.total_findings);
+            if !s.findings_by_kind.is_empty() {
+                let mut kinds: Vec<_> = s.findings_by_kind.iter().collect();
+                kinds.sort_by(|a, b| b.1.cmp(a.1));
+                let parts: Vec<String> =
+                    kinds.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+                println!("  by kind: {}", parts.join(", "));
+            }
+
+            let pairs_with_findings: Vec<_> = analysis
+                .pairs
+                .iter()
+                .filter(|p| !p.findings.is_empty())
+                .take(top)
+                .collect();
+            if pairs_with_findings.is_empty() {
+                println!("\nNo findings.");
+            } else {
+                println!(
+                    "\nTop {} struct pairs by mismatch score:",
+                    pairs_with_findings.len()
+                );
+                for p in pairs_with_findings {
+                    let arity_tag = if p.rust_field_count == p.other_field_count {
+                        format!("{} fields", p.rust_field_count)
+                    } else {
+                        format!(
+                            "rust={} other={} (mismatch)",
+                            p.rust_field_count, p.other_field_count
+                        )
+                    };
+                    println!(
+                        "\n== {} ↔ {}  score={:.1}  {}",
+                        truncate(&p.rust_name, 35),
+                        truncate(&p.other_name, 35),
+                        p.score,
+                        arity_tag,
+                    );
+                    for f in &p.findings {
+                        println!("  [{:>16}] {}: {}", f.kind.name(), f.field, f.detail);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }

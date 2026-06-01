@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Result};
 use crate::compare::{match_reports, metric_vector, Mapping};
 use crate::core::{FunctionAnalysis, Metrics, Report};
+use anyhow::{anyhow, Result};
 use nalgebra::{DMatrix, DVector};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -60,15 +60,12 @@ pub fn feature_vector(f: &FunctionAnalysis) -> Vec<(String, f64)> {
         .map(|(k, x)| (k.to_string(), x))
         .collect();
     v.push(("arity".to_string(), f.signature.inputs.len() as f64));
-    v.push(("outputs_count".to_string(), f.signature.outputs.len() as f64));
     v.push((
-        "constants".to_string(),
-        f.constants.len() as f64,
+        "outputs_count".to_string(),
+        f.signature.outputs.len() as f64,
     ));
-    v.push((
-        "types_used".to_string(),
-        f.types_used.len() as f64,
-    ));
+    v.push(("constants".to_string(), f.constants.len() as f64));
+    v.push(("types_used".to_string(), f.types_used.len() as f64));
     v.push((
         "loc_log".to_string(),
         (f.metrics.loc_code as f64 + 1.0).ln(),
@@ -165,11 +162,7 @@ fn fit_ols(x: &DMatrix<f64>, y: &DVector<f64>, feat_order: &[String]) -> Result<
     let n = y.len() as f64;
     let rmse = (resid.dot(&resid) / n).sqrt();
     let mean_resid = resid.sum() / n;
-    let var = resid
-        .iter()
-        .map(|r| (r - mean_resid).powi(2))
-        .sum::<f64>()
-        / n;
+    let var = resid.iter().map(|r| (r - mean_resid).powi(2)).sum::<f64>() / n;
     let residual_std = var.sqrt().max(1e-6);
 
     let m = beta.len();

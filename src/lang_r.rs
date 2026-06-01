@@ -1,7 +1,9 @@
-use anyhow::{anyhow, Result};
 use crate::analyzer::LanguageAnalyzer;
 use crate::core::{hash_source, Language, Param, Report, Signature, TypeRef};
-use crate::walker::{analyze_function, collect_functions, finalize_early_returns, LanguageSpec, NodeClass};
+use crate::walker::{
+    analyze_function, collect_functions, finalize_early_returns, LanguageSpec, NodeClass,
+};
+use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
 use std::path::Path;
 use tree_sitter::{Node, Parser};
@@ -9,24 +11,34 @@ use tree_sitter::{Node, Parser};
 pub struct RAnalyzer;
 
 impl RAnalyzer {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl Default for RAnalyzer {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LanguageAnalyzer for RAnalyzer {
-    fn language(&self) -> Language { Language::R }
+    fn language(&self) -> Language {
+        Language::R
+    }
 
-    fn extensions(&self) -> &[&'static str] { &["r", "R"] }
+    fn extensions(&self) -> &[&'static str] {
+        &["r", "R"]
+    }
 
     fn analyze_source(&self, src: &str, path: &Path) -> Result<Report> {
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_r::LANGUAGE.into())
             .map_err(|e| anyhow!("set language r: {}", e))?;
-        let tree = parser.parse(src, None).ok_or_else(|| anyhow!("parse failed"))?;
+        let tree = parser
+            .parse(src, None)
+            .ok_or_else(|| anyhow!("parse failed"))?;
         let src_bytes = src.as_bytes();
         let mut report = Report::new(Language::R, path.to_path_buf(), hash_source(src));
 

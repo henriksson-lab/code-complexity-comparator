@@ -1,5 +1,5 @@
-use anyhow::{anyhow, Result};
 use crate::core::{FunctionAnalysis, Report};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path};
@@ -8,6 +8,7 @@ use std::path::{Component, Path};
 pub enum MatchStrategy {
     Mapping,
     FfiAttribute,
+    QualifiedMethod,
     ExactName,
     Normalized,
     Fingerprint,
@@ -24,6 +25,22 @@ pub struct Pair<'a> {
 pub struct Mapping {
     #[serde(default)]
     pub entries: Vec<MappingEntry>,
+    /// Function-like names to suppress from `missing` reports on the
+    /// original-language side. This is intended for C macro/control-flow
+    /// constants that tree-sitter can surface as pseudo-functions in heavily
+    /// macroized C code, not for real translation targets.
+    #[serde(default)]
+    pub ignore_other: Vec<String>,
+    /// Same as `ignore_other`, but for unmatched Rust-side names.
+    #[serde(default)]
+    pub ignore_rust: Vec<String>,
+    /// When true, `missing` reports at most one unmatched original-language
+    /// function per name, and reports none if any same-named original function
+    /// was already paired. This keeps 1:1 pair matching intact while avoiding
+    /// noise from C headers that contain several preprocessor-selected
+    /// platform implementations of the same symbol.
+    #[serde(default)]
+    pub collapse_other_duplicates: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -63,6 +80,28 @@ pub struct MappingEntry {
     /// Same as `rust_class`, for the other-language side.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub other_class: Option<String>,
+    /// Optional explicit parameter mapping for `arg-flow`. Each `[r, o]`
+    /// pair pins Rust parameter index `r` to the other side's parameter
+    /// index `o` (0-based). When set, this overrides Phase A inference and
+    /// is recorded as `ParamMapSource::Explicit`. Unmapped indices on
+    /// either side are left as `None` (no counterpart).
+    ///
+    /// Use this when same-typed parameters can't be disambiguated by
+    /// name/type — e.g. C numeric routines with `(int, int, int)` and
+    /// no helpful names. Example:
+    ///   params = [[0, 1], [1, 0], [2, 2]]
+    /// pins rust 0↔other 1, rust 1↔other 0, rust 2↔other 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Vec<[u32; 2]>>,
+    /// Optional explicit field-name mapping for `struct-diff`. Each
+    /// `[rust_name, other_name]` pair pins one rust field to its
+    /// counterpart. Used for renamed fields that the default
+    /// canonicalisation can't catch — e.g. `count` ↔ `n_items`,
+    /// `payload` ↔ `data`. Fields not listed still go through the
+    /// heuristic passes (exact name → strip-`_` → canonicalise). Example:
+    ///   fields = [["count", "n_items"], ["payload", "data"]]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<[String; 2]>>,
 }
 
 impl Mapping {
@@ -151,7 +190,53 @@ pub fn match_reports<'a>(
         }
     }
 
-    // 3. Exact name match.
+    // 3. C++ qualified method to Rust impl method.
+    //
+    // Faithful Rust ports usually keep the method name as `fn method(...)`
+    // under `impl Type`, while C++ reports the same function as
+    // `Type::method`. Match those structurally before broad name-only passes
+    // so common method names like `run`, `get`, or `clear` do not pair across
+    // unrelated types.
+    let mut by_qualified_rust: HashMap<(String, String), Vec<usize>> = HashMap::new();
+    for (ri, rf) in rust.functions.iter().enumerate() {
+        if used_rust.contains(&ri) {
+            continue;
+        }
+        let Some(class) = rf.enclosing_type.as_deref() else {
+            continue;
+        };
+        by_qualified_rust
+            .entry((normalize_type_name(class), normalize_name(&rf.name)))
+            .or_default()
+            .push(ri);
+    }
+    for (oi, of) in other.functions.iter().enumerate() {
+        if used_other.contains(&oi) {
+            continue;
+        }
+        let Some(q) = parse_qualified_other_name(&of.name) else {
+            continue;
+        };
+        let class = normalize_type_name(q.class);
+        for method in rust_method_names_for_qualified_other(q.class, q.method) {
+            let key = (class.clone(), normalize_name(method));
+            let Some(cands) = by_qualified_rust.get(&key) else {
+                continue;
+            };
+            if let Some(&ri) = cands.iter().find(|ri| !used_rust.contains(ri)) {
+                used_rust.insert(ri);
+                used_other.insert(oi);
+                pairs.push(Pair {
+                    rust: &rust.functions[ri],
+                    other: of,
+                    strategy: MatchStrategy::QualifiedMethod,
+                });
+                break;
+            }
+        }
+    }
+
+    // 4. Exact name match.
     let mut by_name_other: HashMap<&str, usize> = HashMap::new();
     for (oi, f) in other.functions.iter().enumerate() {
         by_name_other.insert(f.name.as_str(), oi);
@@ -173,7 +258,7 @@ pub fn match_reports<'a>(
         }
     }
 
-    // 4. Normalized name match.
+    // 5. Normalized name match.
     let mut by_norm_other: HashMap<String, Vec<usize>> = HashMap::new();
     for (oi, f) in other.functions.iter().enumerate() {
         if used_other.contains(&oi) {
@@ -202,7 +287,7 @@ pub fn match_reports<'a>(
         }
     }
 
-    // 5. Fingerprint fallback: only when names share a substantial token.
+    // 6. Fingerprint fallback: only when names share a substantial token.
     //   Short names ("w", "k", "map") are common as builder methods or
     //   accessors and produce too many spurious matches, so require the
     //   shared token to be >= 4 chars and the fingerprints to match exactly.
@@ -241,6 +326,42 @@ pub fn match_reports<'a>(
     MatchResult { pairs }
 }
 
+struct QualifiedOtherName<'a> {
+    class: &'a str,
+    method: &'a str,
+}
+
+fn parse_qualified_other_name(name: &str) -> Option<QualifiedOtherName<'_>> {
+    let (class, method) = name.rsplit_once("::")?;
+    if class.is_empty() || method.is_empty() {
+        return None;
+    }
+    Some(QualifiedOtherName { class, method })
+}
+
+fn rust_method_names_for_qualified_other<'a>(class: &'a str, method: &'a str) -> Vec<&'a str> {
+    let class = type_basename(class);
+    if method == class {
+        vec!["new", "default"]
+    } else if method == format!("~{}", class) {
+        vec!["drop"]
+    } else {
+        vec![method]
+    }
+}
+
+fn normalize_type_name(name: &str) -> String {
+    normalize_name(type_basename(strip_type_generics(name)))
+}
+
+fn type_basename(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name).trim()
+}
+
+fn strip_type_generics(name: &str) -> &str {
+    name.split(['<', '[', '(']).next().unwrap_or(name).trim()
+}
+
 pub fn normalize_name(name: &str) -> String {
     // Lowercase, split on camelCase and snake_case, drop underscores and common
     // suffixes/prefixes like _impl, _inner, p_, _c, _rs.
@@ -263,7 +384,10 @@ pub fn normalize_name(name: &str) -> String {
 }
 
 fn tokenize_name(name: &str) -> Vec<String> {
-    normalize_name(name).split('_').map(|s| s.to_string()).collect()
+    normalize_name(name)
+        .split('_')
+        .map(|s| s.to_string())
+        .collect()
 }
 
 fn shared_substantial_token(a: &[String], b: &[String]) -> bool {
@@ -355,12 +479,7 @@ mod tests {
         fa_full(name, file, line_start, None)
     }
 
-    fn fa_in_class(
-        name: &str,
-        file: &str,
-        line_start: u32,
-        class: &str,
-    ) -> FunctionAnalysis {
+    fn fa_in_class(name: &str, file: &str, line_start: u32, class: &str) -> FunctionAnalysis {
         fa_full(name, file, line_start, Some(class.to_string()))
     }
 
@@ -391,6 +510,7 @@ mod tests {
             },
             constants: vec![],
             calls: vec![],
+            call_sites: vec![],
             types_used: vec![],
             attributes: Default::default(),
         }
@@ -417,10 +537,75 @@ mod tests {
         assert!(path_suffix_matches(p, Some("/format/messages/datatype.rs")));
         assert!(!path_suffix_matches(p, Some("atype.rs")));
         assert!(!path_suffix_matches(p, Some("link.rs")));
-        assert!(!path_suffix_matches(
-            p,
-            Some("wrong/messages/datatype.rs")
-        ));
+        assert!(!path_suffix_matches(p, Some("wrong/messages/datatype.rs")));
+    }
+
+    #[test]
+    fn qualified_cpp_method_matches_rust_impl_method() {
+        let r = rep(
+            Language::Rust,
+            vec![
+                fa_in_class("run", "/abs/src/other.rs", 1, "Worker"),
+                fa_in_class("forward_pass", "/abs/src/chaining.rs", 10, "Aligner<'a>"),
+            ],
+        );
+        let o = rep(
+            Language::Cpp,
+            vec![fa(
+                "Aligner::forward_pass",
+                "/abs/diamond/src/chaining/greedy_align.cpp",
+            )],
+        );
+
+        let res = match_reports(&r, &o, None);
+        assert_eq!(res.pairs.len(), 1);
+        assert_eq!(res.pairs[0].strategy, MatchStrategy::QualifiedMethod);
+        assert_eq!(res.pairs[0].rust.name, "forward_pass");
+    }
+
+    #[test]
+    fn qualified_cpp_constructor_matches_rust_new() {
+        let r = rep(
+            Language::Rust,
+            vec![fa_in_class(
+                "new",
+                "/abs/src/chaining.rs",
+                10,
+                "Aligner<'a>",
+            )],
+        );
+        let o = rep(
+            Language::Cpp,
+            vec![fa(
+                "Aligner::Aligner",
+                "/abs/diamond/src/chaining/greedy_align.cpp",
+            )],
+        );
+
+        let res = match_reports(&r, &o, None);
+        assert_eq!(res.pairs.len(), 1);
+        assert_eq!(res.pairs[0].strategy, MatchStrategy::QualifiedMethod);
+        assert_eq!(res.pairs[0].rust.name, "new");
+    }
+
+    #[test]
+    fn qualified_cpp_destructor_matches_rust_drop_when_present() {
+        let r = rep(
+            Language::Rust,
+            vec![fa_in_class("drop", "/abs/src/io.rs", 10, "FileSink")],
+        );
+        let o = rep(
+            Language::Cpp,
+            vec![fa(
+                "FileSink::~FileSink",
+                "/abs/diamond/src/util/io/file.cpp",
+            )],
+        );
+
+        let res = match_reports(&r, &o, None);
+        assert_eq!(res.pairs.len(), 1);
+        assert_eq!(res.pairs[0].strategy, MatchStrategy::QualifiedMethod);
+        assert_eq!(res.pairs[0].rust.name, "drop");
     }
 
     #[test]
@@ -457,6 +642,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         let res = match_reports(&r, &o, Some(&m));
         assert_eq!(res.pairs.len(), 2);
@@ -479,10 +665,7 @@ mod tests {
         // remaining duplicates fall through to later strategies.
         let r = rep(
             Language::Rust,
-            vec![
-                fa("decode", "/abs/src/a.rs"),
-                fa("decode", "/abs/src/b.rs"),
-            ],
+            vec![fa("decode", "/abs/src/a.rs"), fa("decode", "/abs/src/b.rs")],
         );
         let o = rep(
             Language::C,
@@ -497,6 +680,7 @@ mod tests {
                 other: "c_decode".into(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let res = match_reports(&r, &o, Some(&m));
         let mapping_pairs: Vec<&Pair> = res
@@ -516,16 +700,16 @@ mod tests {
         let r = rep(
             Language::Rust,
             vec![
-                fa_at("new", "/abs/src/model.rs", 21),   // Strand::new
-                fa_at("new", "/abs/src/model.rs", 153),  // Protein::new
-                fa_at("new", "/abs/src/model.rs", 292),  // Cluster::new
+                fa_at("new", "/abs/src/model.rs", 21),  // Strand::new
+                fa_at("new", "/abs/src/model.rs", 153), // Protein::new
+                fa_at("new", "/abs/src/model.rs", 292), // Cluster::new
             ],
         );
         let o = rep(
             Language::Python,
             vec![
-                fa_at("__init__", "/abs/gecco/model.py", 56),   // Strand
-                fa_at("__init__", "/abs/gecco/model.py", 412),  // Cluster
+                fa_at("__init__", "/abs/gecco/model.py", 56),  // Strand
+                fa_at("__init__", "/abs/gecco/model.py", 412), // Cluster
             ],
         );
         let m = Mapping {
@@ -549,6 +733,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         let res = match_reports(&r, &o, Some(&m));
         let mapped: Vec<&Pair> = res
@@ -558,13 +743,15 @@ mod tests {
             .collect();
         assert_eq!(mapped.len(), 2, "both entries should resolve");
         // Strand pair: Rust line 21 <-> Python line 56.
-        assert!(mapped.iter().any(|p| p.rust.location.line_start == 21
-            && p.other.location.line_start == 56));
+        assert!(mapped
+            .iter()
+            .any(|p| p.rust.location.line_start == 21 && p.other.location.line_start == 56));
         // Cluster pair: Rust line 292 <-> Python line 412. Protein::new at
         // line 153 must be skipped over despite sitting between the two
         // mapped Rust functions in source order.
-        assert!(mapped.iter().any(|p| p.rust.location.line_start == 292
-            && p.other.location.line_start == 412));
+        assert!(mapped
+            .iter()
+            .any(|p| p.rust.location.line_start == 292 && p.other.location.line_start == 412));
     }
 
     #[test]
@@ -604,6 +791,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         let res = match_reports(&r, &o, Some(&m));
         let mapped: Vec<&Pair> = res
@@ -654,10 +842,13 @@ mod tests {
                 other: "__init__".into(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let res = match_reports(&r, &o, Some(&m));
         assert!(
-            !res.pairs.iter().any(|p| p.strategy == MatchStrategy::Mapping),
+            !res.pairs
+                .iter()
+                .any(|p| p.strategy == MatchStrategy::Mapping),
             "line filter eliminates the only candidate"
         );
     }
@@ -676,10 +867,13 @@ mod tests {
                 other: "c_decode".into(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let res = match_reports(&r, &o, Some(&m));
         assert!(
-            !res.pairs.iter().any(|p| p.strategy == MatchStrategy::Mapping),
+            !res.pairs
+                .iter()
+                .any(|p| p.strategy == MatchStrategy::Mapping),
             "no pair should be created via Mapping strategy"
         );
     }

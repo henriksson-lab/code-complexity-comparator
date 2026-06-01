@@ -1,7 +1,5 @@
 use crate::compare::deviation::Weights;
-use crate::compare::matching::{
-    class_matches, path_suffix_matches, MatchResult, MatchStrategy,
-};
+use crate::compare::matching::{class_matches, path_suffix_matches, MatchResult, MatchStrategy};
 use crate::compare::metric_vector;
 use crate::core::{FunctionAnalysis, Report};
 use crate::order;
@@ -115,13 +113,17 @@ pub fn analyze_upstream(
 
     let rust_seed_idx = match rust_seed_idx {
         Some(i) => Some(i),
-        None => other_seed_idx
-            .and_then(|i| pair_by_other.get(&function_key(&other.functions[i])).copied()),
+        None => other_seed_idx.and_then(|i| {
+            pair_by_other
+                .get(&function_key(&other.functions[i]))
+                .copied()
+        }),
     };
     let other_seed_idx = match other_seed_idx {
         Some(i) => Some(i),
-        None => rust_seed_idx
-            .and_then(|i| pair_by_rust.get(&function_key(&rust.functions[i])).copied()),
+        None => {
+            rust_seed_idx.and_then(|i| pair_by_rust.get(&function_key(&rust.functions[i])).copied())
+        }
     };
 
     let rust_upstream_idx = rust_seed_idx
@@ -160,7 +162,8 @@ pub fn analyze_upstream(
                         side: "rust".into(),
                         function: function_ref(rf),
                         counterpart: Some(function_ref(of)),
-                        message: "mapped counterpart is not upstream on the original-code side".into(),
+                        message: "mapped counterpart is not upstream on the original-code side"
+                            .into(),
                     });
                 }
                 if seen_pairs.insert((rkey, okey)) {
@@ -170,7 +173,9 @@ pub fn analyze_upstream(
                         pair_strategy(matches, rkey, okey).unwrap_or(MatchStrategy::Mapping),
                         true,
                         overlap,
-                        deviation_by_pair.get(&(owned_key(rf), owned_key(of))).cloned(),
+                        deviation_by_pair
+                            .get(&(owned_key(rf), owned_key(of)))
+                            .cloned(),
                     ));
                 }
             }
@@ -206,7 +211,9 @@ pub fn analyze_upstream(
                         pair_strategy(matches, rkey, okey).unwrap_or(MatchStrategy::Mapping),
                         overlap,
                         true,
-                        deviation_by_pair.get(&(owned_key(rf), owned_key(of))).cloned(),
+                        deviation_by_pair
+                            .get(&(owned_key(rf), owned_key(of)))
+                            .cloned(),
                     ));
                 }
             }
@@ -229,7 +236,11 @@ pub fn analyze_upstream(
     pair_rows.sort_by(|a, b| {
         a.overlap
             .cmp(&b.overlap)
-            .then_with(|| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| {
+                b.total
+                    .partial_cmp(&a.total)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .then(a.rust.file.cmp(&b.rust.file))
             .then(a.rust.line_start.cmp(&b.rust.line_start))
             .then(a.rust.name.cmp(&b.rust.name))
@@ -246,7 +257,10 @@ pub fn analyze_upstream(
 }
 
 fn sorted_refs(report: &Report, idxs: &[usize]) -> Vec<FunctionRef> {
-    let mut refs: Vec<_> = idxs.iter().map(|&i| function_ref(&report.functions[i])).collect();
+    let mut refs: Vec<_> = idxs
+        .iter()
+        .map(|&i| function_ref(&report.functions[i]))
+        .collect();
     refs.sort_by(|a, b| {
         a.file
             .cmp(&b.file)
@@ -295,7 +309,10 @@ fn fallback_deviation(rust: &FunctionAnalysis, other: &FunctionAnalysis) -> Pair
         per.push((k.to_string(), *rv, *ov, contrib));
     }
     per.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
-    PairDeviation { total, per_metric: per }
+    PairDeviation {
+        total,
+        per_metric: per,
+    }
 }
 
 fn pair_maps<'a>(
@@ -311,7 +328,9 @@ fn pair_maps<'a>(
     for p in &matches.pairs {
         let rkey = function_key(p.rust);
         let okey = function_key(p.other);
-        if let (Some(&ri), Some(&oi)) = (rust_index_by_key.get(&rkey), other_index_by_key.get(&okey)) {
+        if let (Some(&ri), Some(&oi)) =
+            (rust_index_by_key.get(&rkey), other_index_by_key.get(&okey))
+        {
             by_rust.insert(rkey, oi);
             by_other.insert(okey, ri);
         }
@@ -405,13 +424,20 @@ fn resolve_seed(
         .enumerate()
         .filter(|(_, f)| selector.name.as_ref().is_none_or(|name| &f.name == name))
         .filter(|(_, f)| path_suffix_matches(&f.location.file, selector.path.as_deref()))
-        .filter(|(_, f)| selector.line.is_none_or(|line| f.location.line_start == line))
+        .filter(|(_, f)| {
+            selector
+                .line
+                .is_none_or(|line| f.location.line_start == line)
+        })
         .filter(|(_, f)| class_matches(f.enclosing_type.as_deref(), selector.class.as_deref()))
         .map(|(i, _)| i)
         .collect();
 
     match matches.as_slice() {
-        [] => Err(anyhow!("no {} seed function matched the supplied selector", side)),
+        [] => Err(anyhow!(
+            "no {} seed function matched the supplied selector",
+            side
+        )),
         [idx] => Ok(Some(*idx)),
         many => {
             let preview = many
@@ -510,6 +536,7 @@ mod tests {
                     span: (0, 0),
                 })
                 .collect(),
+            call_sites: Vec::new(),
             types_used: Vec::new(),
             attributes: BTreeMap::new(),
         }
@@ -546,10 +573,23 @@ mod tests {
         );
         let mapping = Mapping {
             entries: vec![
-                MappingEntry { rust: "root".into(), other: "root_c".into(), ..Default::default() },
-                MappingEntry { rust: "helper".into(), other: "helper_c".into(), ..Default::default() },
-                MappingEntry { rust: "leaf".into(), other: "leaf_c".into(), ..Default::default() },
+                MappingEntry {
+                    rust: "root".into(),
+                    other: "root_c".into(),
+                    ..Default::default()
+                },
+                MappingEntry {
+                    rust: "helper".into(),
+                    other: "helper_c".into(),
+                    ..Default::default()
+                },
+                MappingEntry {
+                    rust: "leaf".into(),
+                    other: "leaf_c".into(),
+                    ..Default::default()
+                },
             ],
+            ..Default::default()
         };
         let matches = match_reports(&rust, &other, Some(&mapping));
 
@@ -557,7 +597,10 @@ mod tests {
             &rust,
             &other,
             &matches,
-            Some(&FunctionSelector { name: Some("leaf".into()), ..Default::default() }),
+            Some(&FunctionSelector {
+                name: Some("leaf".into()),
+                ..Default::default()
+            }),
             None,
             false,
         )
@@ -614,8 +657,13 @@ mod tests {
                     other: "other_only_parent".into(),
                     ..Default::default()
                 },
-                MappingEntry { rust: "leaf".into(), other: "leaf_c".into(), ..Default::default() },
+                MappingEntry {
+                    rust: "leaf".into(),
+                    other: "leaf_c".into(),
+                    ..Default::default()
+                },
             ],
+            ..Default::default()
         };
         let matches = match_reports(&rust, &other, Some(&mapping));
 
@@ -623,8 +671,14 @@ mod tests {
             &rust,
             &other,
             &matches,
-            Some(&FunctionSelector { name: Some("leaf".into()), ..Default::default() }),
-            Some(&FunctionSelector { name: Some("leaf_c".into()), ..Default::default() }),
+            Some(&FunctionSelector {
+                name: Some("leaf".into()),
+                ..Default::default()
+            }),
+            Some(&FunctionSelector {
+                name: Some("leaf_c".into()),
+                ..Default::default()
+            }),
             false,
         )
         .unwrap();

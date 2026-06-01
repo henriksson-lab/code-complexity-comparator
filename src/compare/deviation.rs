@@ -1,5 +1,5 @@
 use crate::compare::{matching::MatchResult, metric_vector};
-use crate::core::Report;
+use crate::core::{BinaryOperatorSet, Report};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -28,6 +28,12 @@ impl Default for Weights {
             ("early_returns", 0.5),
         ] {
             m.insert(k.to_string(), v);
+        }
+        // Binary operator set: 14 sparse dimensions. Weight each modestly so
+        // the family as a whole nudges similarity without overpowering the
+        // structural metrics above.
+        for (k, _) in BinaryOperatorSet::default().counts() {
+            m.insert(k.to_string(), 0.5);
         }
         Self { per_metric: m }
     }
@@ -83,7 +89,11 @@ pub fn deviation_rows(
             per_metric: per,
         });
     }
-    rows.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
+    rows.sort_by(|a, b| {
+        b.total
+            .partial_cmp(&a.total)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     rows
 }
 

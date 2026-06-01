@@ -6,7 +6,9 @@
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
@@ -71,7 +73,9 @@ impl App {
     }
 
     fn max_scroll(&self) -> u16 {
-        let Some(p) = self.pairs.get(self.idx) else { return 0 };
+        let Some(p) = self.pairs.get(self.idx) else {
+            return 0;
+        };
         let rl = p.rust.as_ref().map(|f| f.line_count()).unwrap_or(0);
         let ol = p.other.as_ref().map(|f| f.line_count()).unwrap_or(0);
         rl.max(ol).saturating_sub(1) as u16
@@ -99,7 +103,10 @@ pub fn detect_other_language(root: &std::path::Path) -> Option<Language> {
         .map(|(l, _)| l)
 }
 
-fn scan_counts(root: &std::path::Path, counts: &mut std::collections::HashMap<Language, usize>) -> std::io::Result<()> {
+fn scan_counts(
+    root: &std::path::Path,
+    counts: &mut std::collections::HashMap<Language, usize>,
+) -> std::io::Result<()> {
     if root.is_file() {
         if let Some(ext) = root.extension().and_then(|e| e.to_str()) {
             *counts.entry(Language::from_ext(ext)).or_insert(0) += 1;
@@ -148,10 +155,7 @@ pub fn run(args: Args) -> Result<()> {
     res
 }
 
-fn event_loop<B: ratatui::backend::Backend>(
-    term: &mut Terminal<B>,
-    app: &mut App,
-) -> Result<()> {
+fn event_loop<B: ratatui::backend::Backend>(term: &mut Terminal<B>, app: &mut App) -> Result<()> {
     loop {
         term.draw(|f| render::draw(f, app))?;
         if let Event::Key(k) = event::read()? {

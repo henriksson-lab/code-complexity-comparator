@@ -1,10 +1,10 @@
-use anyhow::{anyhow, Result};
 use crate::analyzer::LanguageAnalyzer;
 use crate::core::{hash_source, Language, Param, Report, Signature, TypeRef};
 use crate::walker::{
     analyze_function, collect_functions, collect_structs, finalize_early_returns, LanguageSpec,
     NodeClass,
 };
+use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
 use std::path::Path;
 use tree_sitter::{Node, Parser};
@@ -12,24 +12,34 @@ use tree_sitter::{Node, Parser};
 pub struct FortranAnalyzer;
 
 impl FortranAnalyzer {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl Default for FortranAnalyzer {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LanguageAnalyzer for FortranAnalyzer {
-    fn language(&self) -> Language { Language::Fortran }
+    fn language(&self) -> Language {
+        Language::Fortran
+    }
 
-    fn extensions(&self) -> &[&'static str] { &["f", "f90", "f95", "f03", "f08", "for", "ftn"] }
+    fn extensions(&self) -> &[&'static str] {
+        &["f", "f90", "f95", "f03", "f08", "for", "ftn"]
+    }
 
     fn analyze_source(&self, src: &str, path: &Path) -> Result<Report> {
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_fortran::LANGUAGE.into())
             .map_err(|e| anyhow!("set language fortran: {}", e))?;
-        let tree = parser.parse(src, None).ok_or_else(|| anyhow!("parse failed"))?;
+        let tree = parser
+            .parse(src, None)
+            .ok_or_else(|| anyhow!("parse failed"))?;
         let src_bytes = src.as_bytes();
         let mut report = Report::new(Language::Fortran, path.to_path_buf(), hash_source(src));
 
@@ -42,7 +52,13 @@ impl LanguageAnalyzer for FortranAnalyzer {
             }
         }
         finalize_early_returns(&mut report.functions);
-        collect_structs(&spec, tree.root_node(), src_bytes, path, &mut report.structs);
+        collect_structs(
+            &spec,
+            tree.root_node(),
+            src_bytes,
+            path,
+            &mut report.structs,
+        );
         Ok(report)
     }
 }
@@ -58,8 +74,11 @@ impl LanguageSpec for FortranSpec {
             // as distinct sibling clauses of the outer if/where.
             "elseif_clause" | "elsewhere_clause" => NodeClass::SwitchCase,
             "else_clause" => NodeClass::Else,
-            "do_loop_statement" | "do_label_statement" | "while_statement"
-            | "forall_statement" | "concurrent_statement" => NodeClass::Loop,
+            "do_loop_statement"
+            | "do_label_statement"
+            | "while_statement"
+            | "forall_statement"
+            | "concurrent_statement" => NodeClass::Loop,
             // select case / select rank / select type — each case arm is a
             // decision point.
             "case_statement" => NodeClass::SwitchCase,
@@ -71,7 +90,11 @@ impl LanguageSpec for FortranSpec {
             "keyword_statement" => {
                 // `return`, `cycle`, `exit`, `continue`. Treat return as Return
                 // and cycle/exit as Goto (loop-exit jumps).
-                let text = node.utf8_text(src).unwrap_or("").trim().to_ascii_lowercase();
+                let text = node
+                    .utf8_text(src)
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
                 if text.starts_with("return") {
                     NodeClass::Return
                 } else if text.starts_with("cycle") || text.starts_with("exit") {
@@ -83,7 +106,8 @@ impl LanguageSpec for FortranSpec {
             "comment" => NodeClass::Comment,
             "number_literal" => {
                 let text = node.utf8_text(src).unwrap_or("");
-                if text.contains('.') || text.to_ascii_lowercase().contains('e')
+                if text.contains('.')
+                    || text.to_ascii_lowercase().contains('e')
                     || text.to_ascii_lowercase().contains('d')
                 {
                     NodeClass::FloatLit
@@ -104,8 +128,12 @@ impl LanguageSpec for FortranSpec {
                 // `.and.` / `.or.` short-circuit in Fortran.
                 NodeClass::ShortCircuit
             }
-            "binary_expression" | "relational_expression" | "math_expression"
-            | "unary_expression" | "concatenation_expression" | "assignment_statement"
+            "binary_expression"
+            | "relational_expression"
+            | "math_expression"
+            | "unary_expression"
+            | "concatenation_expression"
+            | "assignment_statement"
             | "assignment" => NodeClass::Operator,
             _ => NodeClass::None,
         }

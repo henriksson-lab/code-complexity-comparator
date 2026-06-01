@@ -1,40 +1,48 @@
-use anyhow::{anyhow, Result};
 use crate::core::{Constant, FunctionAnalysis, Language, Metrics, Report};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-pub mod matching;
-pub mod deviation;
+pub mod arg_flow;
+pub mod call_graph;
 pub mod constants_diff;
+pub mod deviation;
+pub mod matching;
 pub mod sort;
+pub mod struct_diff;
 pub mod structs;
 pub mod upstream;
-pub mod call_graph;
 
-pub use matching::{match_reports, Mapping, MatchResult, MatchStrategy, Pair};
-pub use deviation::{deviation_rows, DeviationRow, Weights};
-pub use constants_diff::{constants_diff, ConstantsDiff, FunctionConstantsDiff};
-pub use sort::{sort_report, SortKey};
-pub use structs::{
-    category_histogram, match_structs, struct_deviation_rows, struct_metric_vector,
-    struct_missing, StructDeviationRow, StructMatchResult, StructMatchStrategy, StructMissingReport,
-    StructPair,
-};
-pub use upstream::{
-    analyze_upstream, FunctionRef, FunctionSelector, UpstreamAnalysis, UpstreamPairRow,
-    UpstreamWarning,
+pub use arg_flow::{
+    analyze_arg_flow, infer_parameter_map, ArgFlowAnalysis, ArgFlowFinding, ArgFlowSummary,
+    FindingKind, NoMapReason, PairArgFlow, ParamMapSource, ParameterMap, UnresolvedPair,
 };
 pub use call_graph::{
     analyze_call_graph_diff, CallGraphDiffAnalysis, CallGraphDiffSummary, CallGraphPairDiffRow,
     GraphEdgeRef,
 };
+pub use constants_diff::{constants_diff, ConstantsDiff, FunctionConstantsDiff};
+pub use deviation::{deviation_rows, DeviationRow, Weights};
+pub use matching::{match_reports, Mapping, MatchResult, MatchStrategy, Pair};
+pub use sort::{sort_report, SortKey};
+pub use struct_diff::{
+    analyze_struct_field_diff, FieldFinding, FieldFindingKind, PairFieldDiff,
+    StructFieldDiffAnalysis, StructFieldDiffSummary,
+};
+pub use structs::{
+    category_histogram, match_structs, struct_deviation_rows, struct_metric_vector, struct_missing,
+    StructDeviationRow, StructMatchResult, StructMatchStrategy, StructMissingReport, StructPair,
+};
+pub use upstream::{
+    analyze_upstream, FunctionRef, FunctionSelector, UpstreamAnalysis, UpstreamPairRow,
+    UpstreamWarning,
+};
 
 pub fn load_report(path: &Path) -> Result<Report> {
-    let s = std::fs::read_to_string(path)
-        .map_err(|e| anyhow!("read {}: {}", path.display(), e))?;
-    let r: Report = serde_json::from_str(&s)
-        .map_err(|e| anyhow!("parse {}: {}", path.display(), e))?;
+    let s = std::fs::read_to_string(path).map_err(|e| anyhow!("read {}: {}", path.display(), e))?;
+    let r: Report =
+        serde_json::from_str(&s).map_err(|e| anyhow!("parse {}: {}", path.display(), e))?;
     Ok(r)
 }
 
@@ -51,6 +59,27 @@ pub struct PartialMatch {
     pub other_name: String,
     pub reason: String,
 }
+
+const DEFAULT_C_ARTIFACT_IGNORE: &[&str] = &[
+    "FAIL",
+    "HADDR_UNDEF",
+    "H5_ITER_ERROR",
+    "H5_BEFORE_USER_CB",
+    "H5_BEFORE_USER_CB_NOERR",
+    "FUNC_LEAVE_NOAPI_NAMECHECK_ONLY",
+    "HGOTO_ERROR",
+    "HERROR",
+    "ALL_MEMBERS",
+    "UNIQUE_MEMBERS",
+    "NDEBUG",
+    "assert",
+    "NULL",
+    "if",
+    "while",
+    "switch",
+    "do",
+    "void",
+];
 
 fn function_key(f: &FunctionAnalysis) -> (String, String, u32) {
     (
@@ -87,10 +116,12 @@ fn is_thin_bin_main_wrapper(pair: &Pair<'_>) -> bool {
 }
 
 fn should_exempt_partial(pair: &Pair<'_>) -> bool {
-    pair.strategy == MatchStrategy::Mapping
-        && ((pair.rust.metrics.loc_code <= 1
-            && (is_constructor_name(&pair.other.name) || is_destructor_name(&pair.other.name)))
-            || is_thin_bin_main_wrapper(pair))
+    matches!(
+        pair.strategy,
+        MatchStrategy::Mapping | MatchStrategy::QualifiedMethod
+    ) && ((pair.rust.metrics.loc_code <= 1
+        && (is_constructor_name(&pair.other.name) || is_destructor_name(&pair.other.name)))
+        || is_thin_bin_main_wrapper(pair))
 }
 
 pub fn missing(
@@ -99,20 +130,49 @@ pub fn missing(
     m: &MatchResult,
     stub_loc_ratio: f64,
 ) -> MissingReport {
+    missing_with_ignore(rust, other, m, stub_loc_ratio, None)
+}
+
+pub fn missing_with_ignore(
+    rust: &Report,
+    other: &Report,
+    m: &MatchResult,
+    stub_loc_ratio: f64,
+    mapping: Option<&Mapping>,
+) -> MissingReport {
     let matched_rust: HashSet<(String, String, u32)> =
         m.pairs.iter().map(|p| function_key(p.rust)).collect();
     let matched_other: HashSet<(String, String, u32)> =
         m.pairs.iter().map(|p| function_key(p.other)).collect();
+    let mut covered_other_names: HashSet<&str> =
+        if mapping.is_some_and(|m| m.collapse_other_duplicates) {
+            m.pairs.iter().map(|p| p.other.name.as_str()).collect()
+        } else {
+            HashSet::new()
+        };
+    let ignore_other = ignore_set(mapping.map(|m| m.ignore_other.as_slice()));
+    let ignore_rust = ignore_set(mapping.map(|m| m.ignore_rust.as_slice()));
 
     let mut missing_in_rust = Vec::new();
     for f in &other.functions {
-        if !matched_other.contains(&function_key(f)) {
+        if matched_other.contains(&function_key(f))
+            || ignore_other.contains(f.name.as_str())
+            || is_destructor_name(&f.name)
+        {
+            continue;
+        }
+        if mapping.is_some_and(|m| m.collapse_other_duplicates)
+            && !covered_other_names.insert(f.name.as_str())
+        {
+            continue;
+        }
+        {
             missing_in_rust.push(f.name.clone());
         }
     }
     let mut extra_in_rust = Vec::new();
     for f in &rust.functions {
-        if !matched_rust.contains(&function_key(f)) {
+        if !matched_rust.contains(&function_key(f)) && !ignore_rust.contains(f.name.as_str()) {
             extra_in_rust.push(f.name.clone());
         }
     }
@@ -138,7 +198,19 @@ pub fn missing(
             });
         }
     }
-    MissingReport { missing_in_rust, extra_in_rust, partial }
+    MissingReport {
+        missing_in_rust,
+        extra_in_rust,
+        partial,
+    }
+}
+
+fn ignore_set(configured: Option<&[String]>) -> HashSet<&str> {
+    let mut out: HashSet<&str> = DEFAULT_C_ARTIFACT_IGNORE.iter().copied().collect();
+    if let Some(configured) = configured {
+        out.extend(configured.iter().map(String::as_str));
+    }
+    out
 }
 
 pub fn summary_line(r: &Report) -> String {
@@ -154,12 +226,15 @@ pub fn summary_line(r: &Report) -> String {
 fn languages_compatible(a: Language, b: Language) -> bool {
     matches!(
         (a, b),
-        (Language::Rust, _) | (_, Language::Rust) | (Language::C, Language::Cpp) | (Language::Cpp, Language::C)
+        (Language::Rust, _)
+            | (_, Language::Rust)
+            | (Language::C, Language::Cpp)
+            | (Language::Cpp, Language::C)
     )
 }
 
 pub fn metric_vector(m: &Metrics) -> Vec<(&'static str, f64)> {
-    vec![
+    let mut v = vec![
         ("loc_code", m.loc_code as f64),
         ("loc_comments", m.loc_comments as f64),
         ("branches", m.branches as f64),
@@ -177,7 +252,10 @@ pub fn metric_vector(m: &Metrics) -> Vec<(&'static str, f64)> {
         ("goto_count", m.goto_count as f64),
         ("inputs", m.inputs as f64),
         ("outputs", m.outputs as f64),
-    ]
+    ];
+    // Binary operator set: one similarity dimension per operator symbol.
+    v.extend(m.binary_operators.counts().map(|(k, c)| (k, c as f64)));
+    v
 }
 
 pub fn constants_histogram(fa: &FunctionAnalysis) -> HashMap<&'static str, u32> {
@@ -196,14 +274,15 @@ pub fn dedup_map<T: Clone>(v: &[T], key: impl Fn(&T) -> String) -> BTreeMap<Stri
     m
 }
 
-pub fn constants_by_kind<'a>(fa: &'a FunctionAnalysis) -> BTreeMap<&'static str, Vec<&'a Constant>> {
+pub fn constants_by_kind<'a>(
+    fa: &'a FunctionAnalysis,
+) -> BTreeMap<&'static str, Vec<&'a Constant>> {
     let mut m: BTreeMap<&'static str, Vec<&Constant>> = BTreeMap::new();
     for c in &fa.constants {
         m.entry(c.kind_name()).or_default().push(c);
     }
     m
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -235,6 +314,7 @@ mod tests {
             },
             constants: Vec::new(),
             calls: Vec::new(),
+            call_sites: Vec::new(),
             types_used: vec![TypeRef::new("void")],
             attributes: BTreeMap::new(),
         }
@@ -275,6 +355,7 @@ mod tests {
                 other_path: Some("orig/b.c".into()),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         let matched = match_reports(&rust, &other, Some(&mapping));
@@ -285,6 +366,59 @@ mod tests {
         let rep = missing(&rust, &other, &matched, 0.2);
         assert_eq!(rep.missing_in_rust, vec!["target_c".to_string()]);
         assert_eq!(rep.extra_in_rust, vec!["helper".to_string()]);
+    }
+
+    #[test]
+    fn missing_ignores_default_and_configured_artifacts() {
+        let rust = rep(
+            Language::Rust,
+            vec![fa("extra_helper", "/abs/src/lib.rs", 1)],
+        );
+        let other = rep(
+            Language::C,
+            vec![
+                fa("FAIL", "/abs/orig/a.c", 1),
+                fa("HADDR_UNDEF", "/abs/orig/a.c", 2),
+                fa("PROJECT_MACRO", "/abs/orig/a.c", 3),
+                fa("real_missing", "/abs/orig/a.c", 4),
+            ],
+        );
+        let mapping = Mapping {
+            ignore_other: vec!["PROJECT_MACRO".into()],
+            ignore_rust: vec!["extra_helper".into()],
+            ..Default::default()
+        };
+        let matched = match_reports(&rust, &other, Some(&mapping));
+        let rep = missing_with_ignore(&rust, &other, &matched, 0.2, Some(&mapping));
+        assert_eq!(rep.missing_in_rust, vec!["real_missing"]);
+        assert!(rep.extra_in_rust.is_empty());
+    }
+
+    #[test]
+    fn missing_can_collapse_duplicate_other_names_without_many_to_one_pairs() {
+        let rust = rep(
+            Language::Rust,
+            vec![fa("H5TS_once", "/abs/src/support.rs", 1)],
+        );
+        let other = rep(
+            Language::C,
+            vec![
+                fa("H5TS_once", "/abs/orig/H5TSonce.c", 72),
+                fa("H5TS_once", "/abs/orig/H5TSonce.c", 100),
+                fa("H5TS_once", "/abs/orig/H5TSonce.c", 128),
+                fa("other_missing", "/abs/orig/a.c", 1),
+                fa("other_missing", "/abs/orig/b.c", 1),
+            ],
+        );
+        let mapping = Mapping {
+            collapse_other_duplicates: true,
+            ..Default::default()
+        };
+        let matched = match_reports(&rust, &other, Some(&mapping));
+        assert_eq!(matched.pairs.len(), 1, "matching remains strict 1:1");
+
+        let rep = missing_with_ignore(&rust, &other, &matched, 0.2, Some(&mapping));
+        assert_eq!(rep.missing_in_rust, vec!["other_missing"]);
     }
 
     #[test]
@@ -308,6 +442,7 @@ mod tests {
                 other_path: Some("orig/compact_hash.cc".into()),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         let matched = match_reports(&rust, &other, Some(&mapping));
@@ -317,6 +452,18 @@ mod tests {
         assert!(rep.partial.is_empty());
     }
 
+    #[test]
+    fn missing_ignores_unmatched_cpp_destructors() {
+        let rust = rep(Language::Rust, vec![]);
+        let other = rep(
+            Language::Cpp,
+            vec![fa("FileSink::~FileSink", "/abs/orig/file.cpp", 40)],
+        );
+        let matched = match_reports(&rust, &other, None);
+
+        let rep = missing(&rust, &other, &matched, 0.2);
+        assert!(rep.missing_in_rust.is_empty());
+    }
 
     #[test]
     fn missing_exempts_mapped_bin_main_wrappers_from_partial() {
@@ -335,6 +482,7 @@ mod tests {
                 other_path: Some("classify.cc".into()),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         let matched = match_reports(&rust, &other, Some(&mapping));

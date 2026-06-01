@@ -30,7 +30,11 @@ pub fn constants_diff(m: &MatchResult) -> ConstantsDiff {
         let d = diff_pair(p.rust, p.other);
         per_function.push(d);
     }
-    per_function.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    per_function.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     ConstantsDiff { per_function }
 }
 
@@ -81,8 +85,7 @@ fn diff_pair(rust: &FunctionAnalysis, other: &FunctionAnalysis) -> FunctionConst
         kind_penalty += (r - o).abs();
     }
 
-    let score =
-        only_in_rust.len() as f64 + only_in_other.len() as f64 + 0.5 * kind_penalty;
+    let score = only_in_rust.len() as f64 + only_in_other.len() as f64 + 0.5 * kind_penalty;
 
     FunctionConstantsDiff {
         rust_name: rust.name.clone(),

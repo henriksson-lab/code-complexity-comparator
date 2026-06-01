@@ -16,9 +16,9 @@
 //! ambiguous calls add edges to every candidate (a safe over-approximation
 //! for ordering: it can only pull a dependency earlier, never later). With
 //! `strict = true`, ambiguous calls are dropped instead.
-use anyhow::{anyhow, Result};
 use crate::compare::{match_reports, Mapping, MatchResult, Pair};
 use crate::core::Report;
+use anyhow::{anyhow, Result};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -289,10 +289,13 @@ pub struct CsvFile {
 }
 
 pub fn read_csv(path: &Path) -> Result<CsvFile> {
-    let s = std::fs::read_to_string(path)
-        .map_err(|e| anyhow!("read {}: {}", path.display(), e))?;
+    let s = std::fs::read_to_string(path).map_err(|e| anyhow!("read {}: {}", path.display(), e))?;
     let mut all = parse_csv(&s);
-    let headers = if all.is_empty() { Vec::new() } else { all.remove(0) };
+    let headers = if all.is_empty() {
+        Vec::new()
+    } else {
+        all.remove(0)
+    };
     Ok(CsvFile { headers, rows: all })
 }
 
@@ -396,7 +399,12 @@ pub fn render_annotated_csv(
         );
     }
 
-    let annot_cols = ["rust_name", "rust_file", "rust_line_start", "match_strategy"];
+    let annot_cols = [
+        "rust_name",
+        "rust_file",
+        "rust_line_start",
+        "match_strategy",
+    ];
     let mut new_headers: Vec<String> = csv.headers.clone();
     for h in annot_cols {
         if !new_headers.iter().any(|x| x == h) {
@@ -500,6 +508,7 @@ mod tests {
                     span: (0, 0),
                 })
                 .collect(),
+            call_sites: vec![],
             types_used: vec![],
             attributes: Default::default(),
         }
@@ -621,7 +630,11 @@ mod tests {
 
         let strict = build_call_graph(&r, true);
         assert_eq!(strict.ambiguous_call_sites, 1);
-        let caller_idx = strict.nodes.iter().position(|n| n.name == "caller").unwrap();
+        let caller_idx = strict
+            .nodes
+            .iter()
+            .position(|n| n.name == "caller")
+            .unwrap();
         assert_eq!(strict.edges[caller_idx].len(), 0, "strict drops ambiguous");
     }
 
@@ -662,10 +675,7 @@ mod tests {
         use std::collections::HashMap;
         let r = rep(
             Language::C,
-            vec![
-                mk_fn("a", "/x.c", 1, &["b"]),
-                mk_fn("b", "/x.c", 10, &[]),
-            ],
+            vec![mk_fn("a", "/x.c", 1, &["b"]), mk_fn("b", "/x.c", 10, &[])],
         );
         let g = build_call_graph(&r, false);
         let ord = order_bottom_up(&g);
@@ -697,14 +707,8 @@ mod tests {
     fn annotate_joins_rust_columns() {
         // Source (C) report: one function `foo`. Rust report: one function
         // `foo`. Exact-name match should fill the rust_* columns.
-        let source = rep(
-            Language::C,
-            vec![mk_fn("foo", "/src/x.c", 1, &[])],
-        );
-        let rust = rep(
-            Language::Rust,
-            vec![mk_fn("foo", "/rs/x.rs", 5, &[])],
-        );
+        let source = rep(Language::C, vec![mk_fn("foo", "/src/x.c", 1, &[])]);
+        let rust = rep(Language::Rust, vec![mk_fn("foo", "/rs/x.rs", 5, &[])]);
 
         // Simulate the CSV produced by `order` on the C source.
         let g = build_call_graph(&source, false);
@@ -712,10 +716,7 @@ mod tests {
         let csv_str = render_order_csv(&g, &ord, &HashMap::new());
         let mut all = parse_csv(&csv_str);
         let headers = all.remove(0);
-        let csv = CsvFile {
-            headers,
-            rows: all,
-        };
+        let csv = CsvFile { headers, rows: all };
 
         let annotated = render_annotated_csv(&csv, &source, &rust, None).unwrap();
         let mut rows = parse_csv(&annotated);

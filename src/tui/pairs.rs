@@ -342,8 +342,8 @@ struct FileAnalysis {
 }
 
 fn analyze_file(lang: Language, path: &Path) -> Result<FileAnalysis> {
-    let src = std::fs::read_to_string(path)
-        .map_err(|e| anyhow!("read {}: {}", path.display(), e))?;
+    let src =
+        std::fs::read_to_string(path).map_err(|e| anyhow!("read {}: {}", path.display(), e))?;
     let analyzer: Box<dyn LanguageAnalyzer> = match lang {
         Language::C => Box::new(CAnalyzer::c()),
         Language::Cpp => Box::new(CAnalyzer::cpp()),
@@ -389,7 +389,10 @@ impl FileIndex {
         let mut by_basename: HashMap<String, Vec<PathBuf>> = HashMap::new();
         for p in &all {
             if let Some(base) = p.file_name().and_then(|s| s.to_str()) {
-                by_basename.entry(base.to_string()).or_default().push(p.clone());
+                by_basename
+                    .entry(base.to_string())
+                    .or_default()
+                    .push(p.clone());
             }
         }
         Ok(Self { all, by_basename })

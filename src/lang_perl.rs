@@ -1,7 +1,9 @@
-use anyhow::{anyhow, Result};
 use crate::analyzer::LanguageAnalyzer;
 use crate::core::{hash_source, Language, Param, Report, Signature, TypeRef};
-use crate::walker::{analyze_function, collect_functions, finalize_early_returns, LanguageSpec, NodeClass};
+use crate::walker::{
+    analyze_function, collect_functions, finalize_early_returns, LanguageSpec, NodeClass,
+};
+use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
 use std::path::Path;
 use tree_sitter::{Node, Parser};
@@ -9,24 +11,34 @@ use tree_sitter::{Node, Parser};
 pub struct PerlAnalyzer;
 
 impl PerlAnalyzer {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl Default for PerlAnalyzer {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LanguageAnalyzer for PerlAnalyzer {
-    fn language(&self) -> Language { Language::Perl }
+    fn language(&self) -> Language {
+        Language::Perl
+    }
 
-    fn extensions(&self) -> &[&'static str] { &["pl", "pm", "t"] }
+    fn extensions(&self) -> &[&'static str] {
+        &["pl", "pm", "t"]
+    }
 
     fn analyze_source(&self, src: &str, path: &Path) -> Result<Report> {
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_perl_next::LANGUAGE.into())
             .map_err(|e| anyhow!("set language perl: {}", e))?;
-        let tree = parser.parse(src, None).ok_or_else(|| anyhow!("parse failed"))?;
+        let tree = parser
+            .parse(src, None)
+            .ok_or_else(|| anyhow!("parse failed"))?;
         let src_bytes = src.as_bytes();
         let mut report = Report::new(Language::Perl, path.to_path_buf(), hash_source(src));
 
@@ -51,7 +63,9 @@ impl LanguageSpec for PerlSpec {
             "subroutine_declaration_statement" | "method_declaration_statement" => {
                 NodeClass::Function
             }
-            "conditional_statement" | "postfix_conditional_expression" | "conditional_expression" => {
+            "conditional_statement"
+            | "postfix_conditional_expression"
+            | "conditional_expression" => {
                 // conditional_statement covers if/unless; postfix/ternary are
                 // single decision points too.
                 if node.kind() == "conditional_expression" {
@@ -63,15 +77,21 @@ impl LanguageSpec for PerlSpec {
             // elsif is its own node (not a nested if_statement) — flat decision.
             "elsif" => NodeClass::SwitchCase,
             "else" => NodeClass::Else,
-            "loop_statement" | "for_statement" | "cstyle_for_statement"
-            | "postfix_loop_expression" | "postfix_for_expression" => NodeClass::Loop,
+            "loop_statement"
+            | "for_statement"
+            | "cstyle_for_statement"
+            | "postfix_loop_expression"
+            | "postfix_for_expression" => NodeClass::Loop,
             // try/catch: each `catch` clause would be +1, but tree-sitter-perl
             // represents the whole try_statement as one node — count as a
             // single decision for now.
             "try_statement" => NodeClass::SwitchCase,
-            "function_call_expression" | "method_call_expression"
-            | "coderef_call_expression" | "ambiguous_function_call_expression"
-            | "func0op_call_expression" | "func1op_call_expression" => NodeClass::Call,
+            "function_call_expression"
+            | "method_call_expression"
+            | "coderef_call_expression"
+            | "ambiguous_function_call_expression"
+            | "func0op_call_expression"
+            | "func1op_call_expression" => NodeClass::Call,
             "return_expression" => NodeClass::Return,
             // last/next/redo are loop-exit jumps. Treat as Goto (they break
             // linear flow like gotos).
@@ -86,8 +106,11 @@ impl LanguageSpec for PerlSpec {
                     NodeClass::IntLit
                 }
             }
-            "string_literal" | "interpolated_string_literal" | "command_string"
-            | "heredoc_content" | "quoted_word_list" => NodeClass::StrLit,
+            "string_literal"
+            | "interpolated_string_literal"
+            | "command_string"
+            | "heredoc_content"
+            | "quoted_word_list" => NodeClass::StrLit,
             "boolean" => {
                 let text = node.utf8_text(src).unwrap_or("");
                 NodeClass::BoolLit(text.trim() == "true")
@@ -108,7 +131,9 @@ impl LanguageSpec for PerlSpec {
                 NodeClass::Operator
             }
             "lowprec_logical_expression" => NodeClass::ShortCircuit,
-            "unary_expression" | "assignment_expression" | "postinc_expression"
+            "unary_expression"
+            | "assignment_expression"
+            | "postinc_expression"
             | "preinc_expression" => NodeClass::Operator,
             "block" => NodeClass::Block,
             _ => NodeClass::None,
@@ -150,13 +175,17 @@ impl LanguageSpec for PerlSpec {
                 let mut cur2 = c.walk();
                 for p in c.children(&mut cur2) {
                     match p.kind() {
-                        "mandatory_parameter" | "optional_parameter" | "named_parameter"
+                        "mandatory_parameter"
+                        | "optional_parameter"
+                        | "named_parameter"
                         | "slurpy_parameter" => {
                             let text = p.utf8_text(src).unwrap_or("").trim().to_string();
                             // Pick the first $/@/% variable token as the name.
                             let name = text
                                 .split(|c: char| c == ' ' || c == '=' || c == ',')
-                                .find(|t| t.starts_with('$') || t.starts_with('@') || t.starts_with('%'))
+                                .find(|t| {
+                                    t.starts_with('$') || t.starts_with('@') || t.starts_with('%')
+                                })
                                 .unwrap_or(&text)
                                 .to_string();
                             sig.inputs.push(Param {
